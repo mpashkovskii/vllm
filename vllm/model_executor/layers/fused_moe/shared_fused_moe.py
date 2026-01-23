@@ -67,11 +67,17 @@ class SharedFusedMoE(FusedMoE):
 
                 # Reduce shared expert outputs if necessary, since the MLP
                 # should have been created with reduce_results=False.
-                if (
-                    self.reduce_results
-                    and get_tensor_model_parallel_world_size() > 1
-                    and self.must_reduce_shared_expert_outputs()
-                ):
+                # When must_reduce_shared_expert_outputs()=True OR MORI-EP is used,
+                # the main all-reduce is SKIPPED, so we MUST reduce shared
+                # output here regardless of reduce_results setting.
+                tp_size = get_tensor_model_parallel_world_size()
+                must_reduce = self.must_reduce_shared_expert_outputs()
+                uses_mori_ep = (
+                    self.moe_parallel_config is not None
+                    and self.moe_parallel_config.all2all_backend == "mori_ep"
+                )
+                should_reduce = must_reduce or uses_mori_ep
+                if tp_size > 1 and should_reduce:
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
             else:
                 shared_out = None
@@ -85,12 +91,29 @@ class SharedFusedMoE(FusedMoE):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
-            # ensure early TP reduction of shared expert outputs when required
+            # Ensure early TP reduction of shared expert outputs when required.
+            # When must_reduce_shared_expert_outputs()=True (MORI-EP, etc.),
+            # the combine kernel reduces ROUTED expert output, but NOT shared
+            # expert output. So we MUST reduce shared output here regardless
+            # of reduce_results setting (which controls the final all-reduce
+            # that is SKIPPED when must_reduce_shared_expert_outputs()=True).
+            tp_size = get_tensor_model_parallel_world_size()
+
+            # Check if we need to reduce shared output:
+            # 1. Standard check via must_reduce_shared_expert_outputs()
+            # 2. OR if MORI-EP is used (which reduces routed output but not shared)
+            must_reduce = self.must_reduce_shared_expert_outputs()
+            uses_mori_ep = (
+                self.moe_parallel_config is not None
+                and self.moe_parallel_config.all2all_backend == "mori_ep"
+            )
+            should_reduce = must_reduce or uses_mori_ep
+
             if (
                 shared_out is not None
-                and self.reduce_results
-                and get_tensor_model_parallel_world_size() > 1
-                and self.must_reduce_shared_expert_outputs()
+                and tp_size > 1
+                and should_reduce
             ):
                 shared_out = tensor_model_parallel_all_reduce(shared_out)
+
         return shared_out, fused_out
