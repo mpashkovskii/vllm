@@ -232,12 +232,36 @@ def maybe_make_prepare_finalize(
         )
         handle = all2all_manager.get_handle(all_to_all_args)
 
-        prepare_finalize = MoriPrepareAndFinalize(
-            handle,
-            max_tokens_per_rank=moe.max_num_tokens,
-            num_dispatchers=all2all_manager.world_size,
-            use_fp8_dispatch=use_fp8_dispatch,
+        # Detect TP+EP mode for dispatch-free optimization
+        use_tp_ep = (
+            moe.moe_parallel_config.tp_size > 1
+            and moe.moe_parallel_config.use_ep
         )
+
+        if use_tp_ep:
+            # Enable dispatch-free optimization for TP+EP
+            num_local_experts = moe.num_experts // all2all_manager.world_size
+            rank_expert_offset = all2all_manager.rank * num_local_experts
+            ep_group = get_ep_group().device_group
+
+            prepare_finalize = MoriPrepareAndFinalize(
+                handle,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_dispatchers=all2all_manager.world_size,
+                use_fp8_dispatch=use_fp8_dispatch,
+                num_local_experts=num_local_experts,
+                rank_expert_offset=rank_expert_offset,
+                ep_group=ep_group,
+                enable_dispatch_free=True,
+            )
+        else:
+            # Standard MORI dispatch
+            prepare_finalize = MoriPrepareAndFinalize(
+                handle,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_dispatchers=all2all_manager.world_size,
+                use_fp8_dispatch=use_fp8_dispatch,
+            )
 
     elif moe.use_fi_all2allv_kernels:
         assert quant_config is not None
