@@ -60,9 +60,18 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self._original_batch_size: int = 0
         
         if self.use_dispatch_free:
+            # Validate that we have a proper distributed backend for multi-node
+            backend = torch.distributed.get_backend(ep_group) if ep_group else None
+            if backend and backend not in ['nccl', 'gloo']:
+                logger.warning(
+                    f"Dispatch-free optimization uses all-reduce with backend '{backend}'. "
+                    f"For optimal multi-node performance, use 'nccl' backend."
+                )
+            
             logger.info(
                 "MORI-EP dispatch-free optimization enabled. "
-                "Dispatch All-to-All will be skipped for ~45%% communication savings."
+                "Dispatch All-to-All will be skipped for ~45%% communication savings. "
+                "Using PyTorch distributed all-reduce for multi-node aggregation."
             )
 
     @property
@@ -252,22 +261,44 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         output: torch.Tensor,
         fused_expert_output: torch.Tensor,
     ) -> None:
-        """Dispatch-free finalize using all-reduce."""
-        assert self.ep_group is not None
+        """
+        Dispatch-free finalize using all-reduce for multi-node communication.
         
+        This method aggregates expert outputs across all EP ranks using
+        PyTorch's optimized all-reduce collective. Unlike MORI's combine
+        operation (which uses All-to-All), this uses a simpler reduction
+        pattern that's efficient for multi-node setups with RDMA/InfiniBand.
+        
+        Note: MORI library doesn't provide all-reduce primitives - it only
+        handles All-to-All patterns for dispatch/combine. For reductions,
+        we rely on PyTorch's distributed backend which has optimized
+        multi-node implementations (NCCL/RCCL for intra-node, NCCL/Gloo
+        for inter-node).
+        """
+        assert self.ep_group is not None, \
+            "Expert parallel group required for dispatch-free finalize"
+        
+        # Create buffer for local contributions
+        # Each rank contributes expert outputs for its assigned tokens
         local_contribution = torch.zeros_like(output)
+        
+        # Place local expert outputs at correct token positions
         if (
             fused_expert_output.numel() > 0
             and self._local_token_indices is not None
             and len(self._local_token_indices) > 0
         ):
+            num_local_tokens = len(self._local_token_indices)
             local_contribution[self._local_token_indices] = fused_expert_output[
-                : len(self._local_token_indices)
+                :num_local_tokens
             ]
-
+        
+        # All-reduce across EP group to aggregate contributions
+        # This works efficiently for multi-node with NCCL/RCCL + InfiniBand
         torch.distributed.all_reduce(
             local_contribution,
             op=torch.distributed.ReduceOp.SUM,
             group=self.ep_group,
         )
+        
         output.copy_(local_contribution)
