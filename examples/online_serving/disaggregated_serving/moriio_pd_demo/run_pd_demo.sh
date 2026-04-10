@@ -211,6 +211,27 @@ txt = txt.replace(
 open(f, 'w').write(txt)
 print('Patched moriio_common.py in', f)
 "
+
+# Patch the toy proxy to avoid importing vllm (which triggers heavy GPU
+# initialisation and crashes when run as a second process in the container).
+# Replace the vllm import with an inline class that provides the same constant.
+python3 -c "
+import inspect, importlib, sys
+sys.path.insert(0, '/app/vllm')
+import examples.online_serving.disaggregated_serving.moriio_toy_proxy_server as _mod
+f = inspect.getfile(_mod)
+txt = open(f).read()
+old = '''from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    MoRIIOConstants,
+)'''
+new = '''class MoRIIOConstants:
+    TRANSFER_PREFIX = \"tx\"'''
+if old in txt:
+    open(f, 'w').write(txt.replace(old, new))
+    print('Patched moriio_toy_proxy_server.py in', f)
+else:
+    print('Toy proxy already patched or import not found — skipping')
+" 2>/dev/null || true
 PATCH_EOF
 )
 
@@ -321,10 +342,26 @@ if [[ "${USE_GSM8K}" == "1" ]]; then
 GSM8K_LOG="${LOG_DIR}/gsm8k_results.log"
 GSM8K_JSON="${LOG_DIR}/gsm8k_results.json"
 GSM8K_SCRIPT="/app/vllm/tests/evals/gsm8k/gsm8k_eval.py"
+# Host-side path (so we can copy the script into the container if the
+# pre-built image predates the Dockerfile change that added tests/evals/).
+GSM8K_HOST_SCRIPT="$(cd "$(dirname "$0")/../../../.."; pwd)/tests/evals/gsm8k/gsm8k_eval.py"
 
 echo ""
 echo ">>> Running GSM8K accuracy evaluation through vllm-router..."
 echo "    (1319 questions, 5-shot, temperature=0, results → ${GSM8K_LOG})"
+
+# Ensure the eval script is present in the container (pre-built images may
+# not have tests/ copied in; fall back to the host repo copy).
+if ! docker exec moriio-prefill test -f "${GSM8K_SCRIPT}" 2>/dev/null; then
+    if [[ -f "${GSM8K_HOST_SCRIPT}" ]]; then
+        echo "    gsm8k_eval.py not found in image — copying from host repo..."
+        docker exec moriio-prefill mkdir -p "$(dirname "${GSM8K_SCRIPT}")"
+        docker cp "${GSM8K_HOST_SCRIPT}" "moriio-prefill:${GSM8K_SCRIPT}"
+    else
+        echo "ERROR: gsm8k_eval.py not found in image or host repo (${GSM8K_HOST_SCRIPT})" >&2
+        exit 1
+    fi
+fi
 {
     echo "======================================================"
     echo "  GSM8K evaluation via MoRIIO PD-disaggregation"
@@ -367,15 +404,19 @@ BENCH_LOG="${LOG_DIR}/benchmark_results.log"
 TOY_PROXY_CONTAINER_PATH="/app/vllm/examples/online_serving/disaggregated_serving/moriio_toy_proxy_server.py"
 
 # Common args shared by both benchmark runs
+BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-16}"
+BENCH_NUM_WARMUPS=$((BENCH_MAX_CONCURRENCY * 2))
+BENCH_NUM_PROMPTS=$((BENCH_MAX_CONCURRENCY * 10))
+
 BENCH_ARGS=(
     --backend vllm
     --model "${MODEL}"
     --dataset-name random
     --random-input-len 1000
     --random-output-len 1000
-    --max-concurrency 16
-    --num-warmups 20
-    --num-prompts 200
+    --max-concurrency "${BENCH_MAX_CONCURRENCY}"
+    --num-warmups "${BENCH_NUM_WARMUPS}"
+    --num-prompts "${BENCH_NUM_PROMPTS}"
     --ready_check_timeout_sec 3000
     --seed 1234
 )
@@ -424,11 +465,36 @@ echo ""
 echo ">>> Stopping vllm-router..."
 docker rm -f moriio-router
 
+echo ">>> Installing toy proxy dependencies inside moriio-prefill..."
+docker exec moriio-prefill pip install --quiet --ignore-installed quart aiohttp
+
 echo ">>> Starting toy proxy inside moriio-prefill (HTTP ${ROUTER_PORT}, ZMQ ${PROXY_PING_PORT})..."
-docker exec -d moriio-prefill bash -c \
-    "pip install --quiet quart aiohttp && \
-     PROXY_HTTP_PORT=${ROUTER_PORT} PROXY_PING_PORT=${PROXY_PING_PORT} \
-     python3 ${TOY_PROXY_CONTAINER_PATH} > /tmp/toy_proxy.log 2>&1"
+# Use nohup + & so the process survives after docker exec exits; the log is
+# written by the shell before python starts so any crash is captured.
+# Pass the port env vars explicitly — docker exec does not inherit the host env.
+docker exec \
+    -e PROXY_HTTP_PORT="${ROUTER_PORT}" \
+    -e PROXY_PING_PORT="${PROXY_PING_PORT}" \
+    moriio-prefill bash -c \
+    "rm -f /tmp/toy_proxy.log && \
+     nohup python3 ${TOY_PROXY_CONTAINER_PATH} \
+         > /tmp/toy_proxy.log 2>&1 &
+     sleep 1 && echo 'toy proxy pid:' \$! && cat /tmp/toy_proxy.log || true"
+
+# Wait for the toy proxy HTTP port to accept connections before polling ZMQ registrations
+echo "Waiting for toy proxy HTTP port ${ROUTER_PORT} to open..."
+_tp_wait=0
+while ! docker exec moriio-prefill bash -c \
+        "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',${ROUTER_PORT}),1); s.close()\"" \
+        >/dev/null 2>&1; do
+    sleep 2
+    _tp_wait=$((_tp_wait + 2))
+    if [[ "${_tp_wait}" -ge 30 ]]; then
+        echo "WARNING: toy proxy HTTP port did not open after 30s — check /tmp/toy_proxy.log inside moriio-prefill" >&2
+        docker exec moriio-prefill cat /tmp/toy_proxy.log >&2 || true
+        break
+    fi
+done
 
 wait_for_toy_proxy_registrations
 

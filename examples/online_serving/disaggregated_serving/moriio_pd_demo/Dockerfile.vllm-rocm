@@ -96,6 +96,8 @@ RUN python3 -c "import torch; assert torch.version.hip is not None, \
 
 # Copy examples so the proxy server script is available inside the container
 COPY --from=build_vllm /app/vllm/examples /app/vllm/examples
+# Copy the GSM8K evaluation script (used by run_pd_demo.sh with USE_GSM8K=1)
+COPY --from=build_vllm /app/vllm/tests/evals /app/vllm/tests/evals
 
 # Performance / correctness env vars from the official ROCm Dockerfile
 ENV TOKENIZERS_PARALLELISM=false

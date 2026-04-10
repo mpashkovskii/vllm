@@ -33,13 +33,22 @@ docker pull ghcr.io/simondanielsson/vllm-router:dev-streaming
 
 #### Router image
 
-Build from the **root of the vllm-router repo** (`~/repos/router`):
-
 ```bash
-cd ~/repos/router
+# clone the fork with the PR
+git clone git@github.com:simondanielsson/router.git
+cd router
+# To build the image with basic mori support
+git switch feature/moriio-support
 docker build \
     -f <path-to-this-dir>/Dockerfile.router \
     -t ghcr.io/simondanielsson/vllm-router:dev \
+    .
+
+# To build the image with mori support + streaming: this branch contains the two PR's on top of each other
+git switch reprod/moriio-support-and-streaming
+docker build \
+    -f <path-to-this-dir>/Dockerfile.router \
+    -t ghcr.io/simondanielsson/vllm-router:dev-streaming \
     .
 ```
 
@@ -48,7 +57,10 @@ docker build \
 Build from the **root of this vllm repo**:
 
 ```bash
-cd ~/repos/mpashkov/vllm
+# clone the fork
+git clone git@github.com:mpashkovskii/vllm.git
+cd vllm
+git switch fix/moriio-sane-defaults
 docker build \
     -f examples/online_serving/disaggregated_serving/moriio_pd_demo/Dockerfile.vllm-rocm \
     -t ghcr.io/simondanielsson/vllm-rocm-moriio:dev \
