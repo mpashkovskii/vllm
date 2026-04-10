@@ -1,0 +1,47 @@
+# Dockerfile for vllm-router (Rust binary)
+#
+# Build context: the root of the vllm-router repo (~/ repos/router).
+#
+#   docker build -f Dockerfile.router -t vllm-router:dev .
+#
+# Adapted from the upstream Dockerfile.router, but kept as a standalone file
+# so it can be referenced from the demo without modifying the router repo.
+
+FROM docker.io/rustlang/rust:nightly-bullseye AS rust-builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cache dependency compilation layer separately from source changes
+COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+# Dummy main so cargo can resolve/compile deps without full source
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs
+RUN cargo build --release || true
+RUN rm -f src/main.rs
+
+# Now copy real source and build
+COPY src ./src
+RUN cargo build --release
+
+# ── runtime image ────────────────────────────────────────────────────────────
+FROM docker.io/debian:bullseye-slim AS runtime
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl1.1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust-builder /app/target/release/vllm-router /usr/local/bin/vllm-router
+RUN chmod +x /usr/local/bin/vllm-router
+
+EXPOSE 8080
+EXPOSE 29000
+
+CMD ["vllm-router", "--host", "0.0.0.0", "--port", "8080"]
