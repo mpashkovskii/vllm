@@ -168,10 +168,9 @@ vllm bench serve \
 
 ---
 
-## 5. GSM8K accuracy evaluation
+## 5. GSM8K accuracy evaluation (two-phase comparison)
 
-To validate that PD-disaggregation produces correct outputs, run the GSM8K accuracy
-evaluation against the router instead of a perf benchmark:
+To compare accuracy between the vllm-router and the toy proxy, run:
 
 ```bash
 MODEL=Qwen/Qwen3-8B \
@@ -181,16 +180,25 @@ USE_GSM8K=1 \
 ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo.sh
 ```
 
-This uses vLLM's built-in `tests/evals/gsm8k/gsm8k_eval.py` script, which sends the
-full GSM8K test set (1 319 questions, 5-shot, temperature=0) through the router so all
-requests flow through the MoRIIO PD-disaggregation pipeline.
+This uses vLLM's built-in `tests/evals/gsm8k/gsm8k_eval.py` script (1 319 questions,
+5-shot, temperature=0, seed=42) and runs it **twice**:
+
+1. **Phase 1** — through `vllm-router` (services already running)
+2. **Phase 2** — vllm-router is replaced by `moriio_toy_proxy_server.py`; prefill and
+   decode are restarted so they re-register with the new proxy, then the eval runs again
+
+At the end the script prints a side-by-side summary of accuracy, invalid-response rate,
+and throughput for both routers.
 
 Results are written to:
 
 | File | Contents |
 |------|----------|
-| `~/moriio-logs/gsm8k_results.log` | Human-readable accuracy summary |
-| `~/moriio-logs/gsm8k_results.json` | Machine-readable JSON with all metrics |
+| `~/moriio-logs/gsm8k_results_router.log` | Phase 1 human-readable summary (vllm-router) |
+| `~/moriio-logs/gsm8k_results_router.json` | Phase 1 machine-readable JSON |
+| `~/moriio-logs/gsm8k_results_toy_proxy.log` | Phase 2 human-readable summary (toy proxy) |
+| `~/moriio-logs/gsm8k_results_toy_proxy.json` | Phase 2 machine-readable JSON |
+| `~/moriio-logs/toy_proxy.log` | Toy proxy container logs |
 
 > **Note:** `USE_GSM8K=1` and `USE_BENCH=1` are mutually exclusive — GSM8K takes
 > priority if both are set.

@@ -65,6 +65,56 @@ HOST_IP="${HOST_IP:-$(docker network inspect bridge \
 
 mkdir -p "${LOG_DIR}"
 
+# ── Toy-proxy patch: fix non-streaming responses ──────────────────────────────
+# gsm8k_eval.py (and any non-streaming client) posts without "stream": true.
+# The toy proxy always returns an async-generator response, which Quart labels
+# as text/html.  This patch makes handle_request() buffer + return a proper
+# JSON response when the client did not request streaming.
+# The patch script is mounted read-only into the toy-proxy container and run
+# once at startup, before the proxy process is launched.
+TOY_PROXY_PATCH_SCRIPT="$(mktemp /tmp/patch_toy_proxy.XXXXXX.py)"
+cat > "${TOY_PROXY_PATCH_SCRIPT}" << 'PYEOF'
+import pathlib
+
+TARGET = pathlib.Path(
+    "/app/vllm/examples/online_serving/disaggregated_serving/moriio_toy_proxy_server.py"
+)
+src = TARGET.read_text()
+
+OLD = (
+    "        session, decode_response = await decode_request_task\n"
+    "        stream_generator = stream_decode_response(session, decode_response, request_id)\n"
+    "        response = await make_response(stream_generator)\n"
+    "        return response"
+)
+NEW = (
+    "        session, decode_response = await decode_request_task\n"
+    "        if req_data.get(\"stream\", False):\n"
+    "            stream_generator = stream_decode_response(\n"
+    "                session, decode_response, request_id\n"
+    "            )\n"
+    "            response = await make_response(stream_generator)\n"
+    "            return response\n"
+    "        else:\n"
+    "            try:\n"
+    "                body = await decode_response.read()\n"
+    "                content_type = decode_response.headers.get(\n"
+    "                    \"Content-Type\", \"application/json\"\n"
+    "                )\n"
+    "            finally:\n"
+    "                await session.close()\n"
+    "            response = await make_response(body, decode_response.status)\n"
+    "            response.headers[\"Content-Type\"] = content_type\n"
+    "            return response"
+)
+
+if OLD in src:
+    TARGET.write_text(src.replace(OLD, NEW, 1))
+    print("toy proxy patch: non-streaming fix applied.")
+else:
+    print("toy proxy patch: target not found — skipping (already patched?).")
+PYEOF
+
 echo "=== MoRIIO PD disaggregation demo ==="
 echo "  Model         : ${MODEL}"
 echo "  Host IP       : ${HOST_IP}"
@@ -266,66 +316,196 @@ echo "  (Set KEEP_ALIVE=1 to leave them running.)"
 
 if [[ "${USE_GSM8K}" == "1" ]]; then
 
-# ── GSM8K accuracy evaluation ─────────────────────────────────────────────────
-# Uses vLLM's built-in gsm8k_eval.py which talks directly to the vLLM HTTP
-# server.  We point it at the prefill/decode pair via the router so the
-# requests flow through PD-disaggregation.
+# ── GSM8K two-phase accuracy comparison ───────────────────────────────────────
+# Phase 1 : vllm-router (already running)
+# Phase 2 : toy proxy  (router replaced, vLLM instances restarted)
 #
-# The script is already present in the image at:
+# The eval script is present in the image at:
 #   /app/vllm/tests/evals/gsm8k/gsm8k_eval.py
-GSM8K_LOG="${LOG_DIR}/gsm8k_results.log"
-GSM8K_JSON="${LOG_DIR}/gsm8k_results.json"
 GSM8K_SCRIPT="/app/vllm/tests/evals/gsm8k/gsm8k_eval.py"
-# Host-side path (so we can copy the script into the container if the
-# pre-built image predates the Dockerfile change that added tests/evals/).
+# Host-side fallback in case the pre-built image predates tests/evals/.
 GSM8K_HOST_SCRIPT="$(cd "$(dirname "$0")/../../../.."; pwd)/tests/evals/gsm8k/gsm8k_eval.py"
 
-echo ""
-echo ">>> Running GSM8K accuracy evaluation through vllm-router..."
-echo "    (1319 questions, 5-shot, temperature=0, results → ${GSM8K_LOG})"
+# Per-phase output paths
+GSM8K_ROUTER_LOG="${LOG_DIR}/gsm8k_results_router.log"
+GSM8K_ROUTER_JSON="${LOG_DIR}/gsm8k_results_router.json"
+GSM8K_PROXY_LOG="${LOG_DIR}/gsm8k_results_toy_proxy.log"
+GSM8K_PROXY_JSON="${LOG_DIR}/gsm8k_results_toy_proxy.json"
 
-# Ensure the eval script is present in the container (pre-built images may
-# not have tests/ copied in; fall back to the host repo copy).
-if ! docker exec moriio-prefill test -f "${GSM8K_SCRIPT}" 2>/dev/null; then
-    if [[ -f "${GSM8K_HOST_SCRIPT}" ]]; then
-        echo "    gsm8k_eval.py not found in image — copying from host repo..."
-        docker exec moriio-prefill mkdir -p "$(dirname "${GSM8K_SCRIPT}")"
-        docker cp "${GSM8K_HOST_SCRIPT}" "moriio-prefill:${GSM8K_SCRIPT}"
-    else
-        echo "ERROR: gsm8k_eval.py not found in image or host repo (${GSM8K_HOST_SCRIPT})" >&2
-        exit 1
+TOY_PROXY_CONTAINER_PATH="/app/vllm/examples/online_serving/disaggregated_serving/moriio_toy_proxy_server.py"
+TOY_PROXY_HTTP_PORT=10001
+
+# Helper: ensure gsm8k_eval.py exists in the named container, copying from
+# the host repo if needed.
+ensure_gsm8k_script() {
+    local container="$1"
+    if ! docker exec "${container}" test -f "${GSM8K_SCRIPT}" 2>/dev/null; then
+        if [[ -f "${GSM8K_HOST_SCRIPT}" ]]; then
+            echo "    gsm8k_eval.py not found in image — copying from host repo..."
+            docker exec "${container}" mkdir -p "$(dirname "${GSM8K_SCRIPT}")"
+            docker cp "${GSM8K_HOST_SCRIPT}" "${container}:${GSM8K_SCRIPT}"
+        else
+            echo "ERROR: gsm8k_eval.py not found in image or host repo (${GSM8K_HOST_SCRIPT})" >&2
+            exit 1
+        fi
     fi
-fi
+}
+
+# Helper: run the GSM8K eval inside a container against the given port, tee
+# stdout to log_file, and copy the JSON out of the container.
+run_gsm8k() {
+    local container="$1"
+    local port="$2"
+    local log_file="$3"
+    local json_dest="$4"
+
+    ensure_gsm8k_script "${container}"
+
+    docker exec "${container}" bash -c \
+        "pip install --quiet requests tqdm regex numpy && \
+         python3 ${GSM8K_SCRIPT} \
+             --host http://127.0.0.1 \
+             --port ${port} \
+             --num-questions 1319 \
+             --num-shots 5 \
+             --max-tokens 256 \
+             --temperature 0.0 \
+             --seed 42 \
+             --save-results /tmp/gsm8k_results.json" \
+        2>&1 | tee -a "${log_file}"
+
+    docker cp "${container}:/tmp/gsm8k_results.json" "${json_dest}" 2>/dev/null || true
+}
+
+# ── Phase 1: GSM8K through vllm-router ───────────────────────────────────────
+echo ""
+echo ">>> Phase 1: GSM8K accuracy evaluation through vllm-router..."
+echo "    (1319 questions, 5-shot, temperature=0, results → ${GSM8K_ROUTER_LOG})"
 {
     echo "======================================================"
-    echo "  GSM8K evaluation via MoRIIO PD-disaggregation"
+    echo "  GSM8K evaluation — Phase 1: vllm-router"
     echo "  Model : ${MODEL}"
     echo "  Date  : $(date)"
     echo "======================================================"
-} | tee "${GSM8K_LOG}"
+} | tee "${GSM8K_ROUTER_LOG}"
 
-# Install lightweight deps (requests/tqdm/regex/numpy) then run the eval.
-# The eval script calls the router's /v1/completions endpoint.
-docker exec moriio-prefill bash -c \
-    "pip install --quiet requests tqdm regex numpy && \
-     python3 ${GSM8K_SCRIPT} \
-         --host http://127.0.0.1 \
-         --port ${ROUTER_PORT} \
-         --num-questions 1319 \
-         --num-shots 5 \
-         --max-tokens 256 \
-         --temperature 0.0 \
-         --seed 42 \
-         --save-results /tmp/gsm8k_results.json" \
-    2>&1 | tee -a "${GSM8K_LOG}"
+run_gsm8k "moriio-prefill" "${ROUTER_PORT}" "${GSM8K_ROUTER_LOG}" "${GSM8K_ROUTER_JSON}"
 
-# Copy the JSON results out of the container
-docker cp moriio-prefill:/tmp/gsm8k_results.json "${GSM8K_JSON}" 2>/dev/null || true
+# ── Phase 2: switch to toy proxy and re-run ───────────────────────────────────
+echo ""
+echo ">>> Stopping vllm-router, prefill, and decode for Phase 2..."
+docker rm -f moriio-router moriio-prefill moriio-decode
+
+echo ">>> Starting toy proxy container (HTTP :${TOY_PROXY_HTTP_PORT}, ZMQ :${PROXY_PING_PORT})..."
+docker run -d \
+    --name moriio-toy-proxy \
+    --network host \
+    -v "${TOY_PROXY_PATCH_SCRIPT}:/tmp/patch_toy_proxy.py:ro" \
+    "${VLLM_IMAGE}" \
+    bash -c "pip install --quiet --ignore-installed quart aiohttp msgpack && \
+             python3 /tmp/patch_toy_proxy.py && \
+             python3 -u ${TOY_PROXY_CONTAINER_PATH}"
+
+docker logs -f moriio-toy-proxy 2>&1 | tee "${LOG_DIR}/toy_proxy.log" &
+
+# Wait for the toy proxy HTTP port before starting vLLM instances.
+echo "Waiting for toy proxy HTTP port ${TOY_PROXY_HTTP_PORT} to open..."
+_tp_wait=0
+until curl -sf "http://localhost:${TOY_PROXY_HTTP_PORT}/" >/dev/null 2>&1 \
+   || curl -sf "http://localhost:${TOY_PROXY_HTTP_PORT}/v1/completions" >/dev/null 2>&1 \
+   || nc -z 127.0.0.1 "${TOY_PROXY_HTTP_PORT}" 2>/dev/null; do
+    sleep 2
+    _tp_wait=$((_tp_wait + 2))
+    if [[ "${_tp_wait}" -ge 60 ]]; then
+        echo "WARNING: toy proxy did not open port ${TOY_PROXY_HTTP_PORT} after 60s" >&2
+        docker logs moriio-toy-proxy 2>&1 | tail -20 >&2
+        break
+    fi
+done
+echo "  Toy proxy is up."
+
+echo ">>> Restarting prefill instance (GPU ${PREFILL_GPU}, port ${PREFILL_PORT})..."
+docker run -d \
+    --name moriio-prefill \
+    "${VLLM_COMMON_ARGS[@]}" \
+    -e HIP_VISIBLE_DEVICES="${PREFILL_GPU}" \
+    "${VLLM_IMAGE}" \
+    vllm serve "${MODEL}" \
+        --port "${PREFILL_PORT}" \
+        --max-model-len "${PREFILL_MAX_MODEL_LEN}" \
+        --trust-remote-code \
+        --kv-transfer-config "${PREFILL_KV_CONFIG}"
+
+docker logs -f moriio-prefill 2>&1 | tee "${LOG_DIR}/prefill_phase2.log" &
+
+echo ">>> Restarting decode instance (GPU ${DECODE_GPU}, port ${DECODE_PORT})..."
+docker run -d \
+    --name moriio-decode \
+    "${VLLM_COMMON_ARGS[@]}" \
+    -e HIP_VISIBLE_DEVICES="${DECODE_GPU}" \
+    "${VLLM_IMAGE}" \
+    vllm serve "${MODEL}" \
+        --port "${DECODE_PORT}" \
+        --max-model-len "${DECODE_MAX_MODEL_LEN}" \
+        --trust-remote-code \
+        --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+        --kv-transfer-config "${DECODE_KV_CONFIG}"
+
+docker logs -f moriio-decode 2>&1 | tee "${LOG_DIR}/decode_phase2.log" &
+
+wait_for_health "moriio-prefill" "${PREFILL_PORT}"
+wait_for_health "moriio-decode"  "${DECODE_PORT}"
+
+# Reuse the same registration-wait helper defined in the USE_BENCH block
+# (define it inline here so USE_GSM8K works standalone).
+echo "Waiting for prefill and decode to register with toy proxy..."
+_reg_wait=0
+while true; do
+    _p=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Prefill" || true)
+    _d=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Decode"  || true)
+    if [[ "${_p:-0}" -ge 1 && "${_d:-0}" -ge 1 ]]; then
+        echo "  Both instances registered."
+        break
+    fi
+    sleep 3
+    _reg_wait=$((_reg_wait + 3))
+    if [[ "${_reg_wait}" -ge 120 ]]; then
+        echo "WARNING: timed out waiting for toy proxy registrations after 120s" >&2
+        break
+    fi
+    echo "  Still waiting (${_reg_wait}s / 120s) — prefill=${_p:-0} decode=${_d:-0}..."
+done
 
 echo ""
-echo "=== GSM8K evaluation complete ==="
-echo "  Log  : ${GSM8K_LOG}"
-echo "  JSON : ${GSM8K_JSON}"
+echo ">>> Phase 2: GSM8K accuracy evaluation through toy proxy..."
+echo "    (1319 questions, 5-shot, temperature=0, results → ${GSM8K_PROXY_LOG})"
+{
+    echo "======================================================"
+    echo "  GSM8K evaluation — Phase 2: moriio_toy_proxy_server.py"
+    echo "  Model : ${MODEL}"
+    echo "  Date  : $(date)"
+    echo "======================================================"
+} | tee "${GSM8K_PROXY_LOG}"
+
+run_gsm8k "moriio-prefill" "${TOY_PROXY_HTTP_PORT}" "${GSM8K_PROXY_LOG}" "${GSM8K_PROXY_JSON}"
+
+# ── Side-by-side summary ──────────────────────────────────────────────────────
+echo ""
+echo "=== GSM8K comparison complete ==="
+echo ""
+printf "%-30s  %s\n" "Metric" "vllm-router   toy-proxy"
+printf "%-30s  %s\n" "------" "-----------   ---------"
+for metric in accuracy invalid_responses questions_per_second output_tokens_per_second; do
+    r=$(python3 -c "import json,sys; d=json.load(open('${GSM8K_ROUTER_JSON}')); print(d.get('${metric}','N/A'))" 2>/dev/null || echo "N/A")
+    p=$(python3 -c "import json,sys; d=json.load(open('${GSM8K_PROXY_JSON}')); print(d.get('${metric}','N/A'))" 2>/dev/null || echo "N/A")
+    printf "%-30s  %-13s %s\n" "${metric}" "${r}" "${p}"
+done
+echo ""
+echo "  Phase 1 log  : ${GSM8K_ROUTER_LOG}"
+echo "  Phase 1 JSON : ${GSM8K_ROUTER_JSON}"
+echo "  Phase 2 log  : ${GSM8K_PROXY_LOG}"
+echo "  Phase 2 JSON : ${GSM8K_PROXY_JSON}"
+echo "  Toy proxy log: ${LOG_DIR}/toy_proxy.log"
 
 elif [[ "${USE_BENCH}" == "1" ]]; then
 
@@ -412,8 +592,10 @@ echo ">>> Starting toy proxy container (HTTP :${TOY_PROXY_HTTP_PORT}, ZMQ :${PRO
 docker run -d \
     --name moriio-toy-proxy \
     --network host \
+    -v "${TOY_PROXY_PATCH_SCRIPT}:/tmp/patch_toy_proxy.py:ro" \
     "${VLLM_IMAGE}" \
     bash -c "pip install --quiet --ignore-installed quart aiohttp msgpack && \
+             python3 /tmp/patch_toy_proxy.py && \
              python3 -u ${TOY_PROXY_CONTAINER_PATH}"
 
 docker logs -f moriio-toy-proxy 2>&1 | tee "${LOG_DIR}/toy_proxy.log" &
@@ -511,7 +693,7 @@ fi
 if [[ "${KEEP_ALIVE}" == "1" ]]; then
     echo ""
     echo "KEEP_ALIVE=1 — containers left running."
-    echo "  To tear down: docker rm -f moriio-prefill moriio-decode moriio-router"
+    echo "  To tear down: docker rm -f moriio-prefill moriio-decode moriio-router moriio-toy-proxy"
 else
     echo ""
     echo ">>> Shutting down containers..."
