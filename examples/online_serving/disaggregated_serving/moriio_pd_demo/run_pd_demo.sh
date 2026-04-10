@@ -37,7 +37,10 @@ PREFILL_NOTIFY_PORT="${PREFILL_NOTIFY_PORT:-61005}"
 DECODE_NOTIFY_PORT="${DECODE_NOTIFY_PORT:-61006}"
 
 VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev}"
+# Basic router (smoke-test only — no streaming support)
 ROUTER_IMAGE="${ROUTER_IMAGE:-ghcr.io/simondanielsson/vllm-router:dev}"
+# Streaming-capable router (required for USE_BENCH=1 and USE_GSM8K=1)
+ROUTER_STREAMING_IMAGE="${ROUTER_STREAMING_IMAGE:-ghcr.io/simondanielsson/vllm-router:dev-streaming}"
 
 HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 
@@ -250,13 +253,21 @@ wait_for_health "moriio-prefill" "${PREFILL_PORT}"
 wait_for_health "moriio-decode"  "${DECODE_PORT}"
 
 # ── Launch vllm-router ────────────────────────────────────────────────────────
+# USE_BENCH and USE_GSM8K require the streaming-capable router image.
+if [[ "${USE_BENCH}" == "1" || "${USE_GSM8K}" == "1" ]]; then
+    _ACTIVE_ROUTER_IMAGE="${ROUTER_STREAMING_IMAGE}"
+else
+    _ACTIVE_ROUTER_IMAGE="${ROUTER_IMAGE}"
+fi
+
 echo ""
 echo ">>> Starting vllm-router (port ${ROUTER_PORT}, discovery port ${PROXY_PING_PORT})..."
+echo "    Image: ${_ACTIVE_ROUTER_IMAGE}"
 
 docker run -d \
     --name moriio-router \
     --network host \
-    "${ROUTER_IMAGE}" \
+    "${_ACTIVE_ROUTER_IMAGE}" \
     vllm-router \
         --vllm-pd-disaggregation \
         --vllm-discovery-address "0.0.0.0:${PROXY_PING_PORT}" \
