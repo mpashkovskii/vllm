@@ -84,6 +84,8 @@ VLLM_SERVE_ARGS=(
     --max-model-len 16384
     --enable-expert-parallel
     --trust-remote-code
+    --block-size 1
+    --enforce-eager
 )
 
 # ── KV-transfer configs ───────────────────────────────────────────────────────

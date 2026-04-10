@@ -1,9 +1,10 @@
 # MoRIIO PD-disaggregation demo
 
-Minimal reproduction script for running vLLM PD-disaggregation with the
+Reproduction scripts for running vLLM PD-disaggregation with the
 MoRIIOConnector KV connector and the vllm-router.
 
-Requires two ROCm GPUs on a single host.
+- **Single-host** (`run_pd_demo.sh`): requires two ROCm GPUs on one machine (Qwen3-8B).
+- **Two-node** (`run_pd_demo_2node.sh`): runs DeepSeek-R1 with TP8 across two hosts connected via RDMA.
 
 ---
 
@@ -13,7 +14,8 @@ Requires two ROCm GPUs on a single host.
 |------|---------|
 | `Dockerfile.router` | Builds the `vllm-router` Rust binary |
 | `Dockerfile.vllm-rocm` | Builds vLLM from source on the ROCm base image |
-| `run_pd_demo.sh` | Launches prefill, decode, and router containers |
+| `run_pd_demo.sh` | Launches prefill, decode, and router containers on a single host |
+| `run_pd_demo_2node.sh` | Two-node setup (DeepSeek-R1 with TP8); run on both nodes |
 
 ---
 
@@ -118,6 +120,94 @@ Environment variables:
 | `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0410-1542` | vLLM Docker image name |
 | `ROUTER_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev` | Router image used for smoke-test (no streaming) |
 | `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming` | Router image used for `USE_BENCH=1` / `USE_GSM8K=1` (streaming support required) |
+
+---
+
+## DSR1 on two nodes
+
+Run `run_pd_demo_2node.sh` on two separate nodes. Replace `<node1-ip>` and
+`<node2-ip>` with the actual IP addresses of each host.
+
+The decode node runs the **same script** in all cases — only the prefill node
+changes between benchmark modes.
+
+### Smoke test
+
+#### Node 1 — prefill + router
+
+```bash
+IS_PREFILL=1 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> \
+  ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
+```
+
+#### Node 2 — decode
+
+```bash
+IS_PREFILL=0 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> \
+  ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
+```
+
+### Performance benchmark (`USE_BENCH=1`)
+
+#### Node 1 — prefill + router
+
+```bash
+IS_PREFILL=1 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> USE_BENCH=1 \
+  ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
+```
+
+#### Node 2 — decode
+
+```bash
+IS_PREFILL=0 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> \
+  ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
+```
+
+Benchmark results are written to `~/moriio-logs/benchmark_results.log` on Node 1.
+
+### GSM8K accuracy evaluation (`USE_GSM8K=1`)
+
+#### Node 1 — prefill + router
+
+```bash
+IS_PREFILL=1 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> USE_GSM8K=1 \
+  ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
+```
+
+#### Node 2 — decode
+
+```bash
+IS_PREFILL=0 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> \
+  ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
+```
+
+GSM8K results are written to `~/moriio-logs/gsm8k_results_router.log` (and `.json`)
+on Node 1.
+
+> **Note:** The two-node script does not support the toy-proxy phase (`USE_BENCH` only
+> runs Phase 1 via vllm-router). `USE_GSM8K=1` and `USE_BENCH=1` are mutually exclusive
+> — GSM8K takes priority if both are set.
+
+Environment variables for `run_pd_demo_2node.sh`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IS_PREFILL` | *(required)* | `1` = this node runs prefill + router; `0` = decode only |
+| `PREFILL_IP` | *(required)* | IP address of the prefill/router node |
+| `DECODE_IP` | *(required)* | IP address of the decode node |
+| `MODEL` | `deepseek-ai/DeepSeek-R1-0528` | HuggingFace model id |
+| `PREFILL_PORT` | `8100` | HTTP port for the prefill vLLM server |
+| `DECODE_PORT` | `8200` | HTTP port for the decode vLLM server |
+| `ROUTER_PORT` | `8080` | HTTP port for vllm-router (Node 1 only) |
+| `PROXY_PING_PORT` | `36367` | ZMQ service-discovery port |
+| `HF_HOME` | `~/.cache/huggingface` | Host path to HuggingFace model cache |
+| `LOG_DIR` | `~/moriio-logs` | Directory for logs and benchmark results |
+| `USE_BENCH` | `0` | Set to `1` to run the perf benchmark after startup |
+| `USE_GSM8K` | `0` | Set to `1` to run the GSM8K accuracy evaluation |
+| `KEEP_ALIVE` | `0` | Set to `1` to leave containers running after the script exits |
+| `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0410-1542` | vLLM Docker image |
+| `ROUTER_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev` | Router image (smoke test) |
+| `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming` | Router image for bench/eval |
 
 ---
 
