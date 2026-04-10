@@ -103,7 +103,7 @@ wait_for_health() {
 }
 
 # ── Remove stale containers (if any) ─────────────────────────────────────────
-for cname in moriio-prefill moriio-decode moriio-router; do
+for cname in moriio-prefill moriio-decode moriio-router moriio-toy-proxy; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
         echo "Removing existing container: ${cname}"
         docker rm -f "${cname}"
@@ -421,16 +421,18 @@ BENCH_ARGS=(
     --seed 1234
 )
 
-# Poll the toy proxy log inside the container until both instances have registered
+# Poll docker logs of the toy proxy container until both instances have registered.
+# Using docker logs avoids Python stdout-buffering issues (print() to a file is
+# fully buffered; docker logs reads directly from the container's log driver).
 wait_for_toy_proxy_registrations() {
-    local max_wait=60
+    local max_wait=120
     local interval=3
     local elapsed=0
     echo "Waiting for prefill and decode to register with toy proxy..."
     while true; do
         local p d
-        p=$(docker exec moriio-prefill grep -c "Registered Prefill" /tmp/toy_proxy.log 2>/dev/null || true)
-        d=$(docker exec moriio-prefill grep -c "Registered Decode"  /tmp/toy_proxy.log 2>/dev/null || true)
+        p=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Prefill" || true)
+        d=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Decode"  || true)
         if [[ "${p:-0}" -ge 1 && "${d:-0}" -ge 1 ]]; then
             echo "  Both instances registered."
             return 0
@@ -461,46 +463,77 @@ docker exec moriio-prefill \
         "${BENCH_ARGS[@]}" 2>&1 | tee -a "${BENCH_LOG}"
 
 # ── Phase 2: switch to toy proxy and benchmark again ──────────────────────────
+# The toy proxy's HTTP port is hardcoded in the image as 10001; its ZMQ
+# discovery port defaults to PROXY_PING_PORT (36367), same as vllm-router.
+# We run it as a dedicated container so docker logs captures stdout without
+# any Python output-buffering issues (no grep-on-file race).
+# Prefill and decode are restarted so they register fresh with the new proxy.
+TOY_PROXY_HTTP_PORT=10001
+
 echo ""
-echo ">>> Stopping vllm-router..."
-docker rm -f moriio-router
+echo ">>> Stopping vllm-router, prefill, and decode..."
+docker rm -f moriio-router moriio-prefill moriio-decode
 
-echo ">>> Installing toy proxy dependencies inside moriio-prefill..."
-docker exec moriio-prefill pip install --quiet --ignore-installed quart aiohttp
+echo ">>> Starting toy proxy container (HTTP :${TOY_PROXY_HTTP_PORT}, ZMQ :${PROXY_PING_PORT})..."
+docker run -d \
+    --name moriio-toy-proxy \
+    --network host \
+    "${VLLM_IMAGE}" \
+    bash -c "pip install --quiet --ignore-installed quart aiohttp msgpack && \
+             python3 -u ${TOY_PROXY_CONTAINER_PATH}"
 
-echo ">>> Starting toy proxy inside moriio-prefill (HTTP ${ROUTER_PORT}, ZMQ ${PROXY_PING_PORT})..."
-# Use nohup + & so the process survives after docker exec exits; the log is
-# written by the shell before python starts so any crash is captured.
-# Pass the port env vars explicitly — docker exec does not inherit the host env.
-docker exec \
-    -e PROXY_HTTP_PORT="${ROUTER_PORT}" \
-    -e PROXY_PING_PORT="${PROXY_PING_PORT}" \
-    moriio-prefill bash -c \
-    "rm -f /tmp/toy_proxy.log && \
-     nohup python3 ${TOY_PROXY_CONTAINER_PATH} \
-         > /tmp/toy_proxy.log 2>&1 &
-     sleep 1 && echo 'toy proxy pid:' \$! && cat /tmp/toy_proxy.log || true"
+docker logs -f moriio-toy-proxy 2>&1 | tee "${LOG_DIR}/toy_proxy.log" &
 
-# Wait for the toy proxy HTTP port to accept connections before polling ZMQ registrations
-echo "Waiting for toy proxy HTTP port ${ROUTER_PORT} to open..."
+# Wait for the toy proxy HTTP port before starting vLLM (avoids a race where
+# instances start sending heartbeats before the ZMQ socket is bound).
+echo "Waiting for toy proxy HTTP port ${TOY_PROXY_HTTP_PORT} to open..."
 _tp_wait=0
-while ! docker exec moriio-prefill bash -c \
-        "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',${ROUTER_PORT}),1); s.close()\"" \
-        >/dev/null 2>&1; do
+until curl -sf "http://localhost:${TOY_PROXY_HTTP_PORT}/" >/dev/null 2>&1 \
+   || curl -sf "http://localhost:${TOY_PROXY_HTTP_PORT}/v1/completions" >/dev/null 2>&1 \
+   || nc -z 127.0.0.1 "${TOY_PROXY_HTTP_PORT}" 2>/dev/null; do
     sleep 2
     _tp_wait=$((_tp_wait + 2))
-    if [[ "${_tp_wait}" -ge 30 ]]; then
-        echo "WARNING: toy proxy HTTP port did not open after 30s — check /tmp/toy_proxy.log inside moriio-prefill" >&2
-        docker exec moriio-prefill cat /tmp/toy_proxy.log >&2 || true
+    if [[ "${_tp_wait}" -ge 60 ]]; then
+        echo "WARNING: toy proxy did not open port ${TOY_PROXY_HTTP_PORT} after 60s" >&2
+        docker logs moriio-toy-proxy 2>&1 | tail -20 >&2
         break
     fi
 done
+echo "  Toy proxy is up."
+
+echo ">>> Restarting prefill instance (GPU ${PREFILL_GPU}, port ${PREFILL_PORT})..."
+docker run -d \
+    --name moriio-prefill \
+    "${VLLM_COMMON_ARGS[@]}" \
+    -e HIP_VISIBLE_DEVICES="${PREFILL_GPU}" \
+    "${VLLM_IMAGE}" \
+    bash -c "${BNXT_DRIVER_INSTALL} && pip install --quiet msgpack && ${VLLM_PATCH} && vllm serve '${MODEL}' \
+        --port '${PREFILL_PORT}' \
+        --max-model-len '${PREFILL_MAX_MODEL_LEN}' \
+        --trust-remote-code \
+        --kv-transfer-config '${PREFILL_KV_CONFIG}'"
+
+docker logs -f moriio-prefill 2>&1 | tee "${LOG_DIR}/prefill_phase2.log" &
+
+echo ">>> Restarting decode instance (GPU ${DECODE_GPU}, port ${DECODE_PORT})..."
+docker run -d \
+    --name moriio-decode \
+    "${VLLM_COMMON_ARGS[@]}" \
+    -e HIP_VISIBLE_DEVICES="${DECODE_GPU}" \
+    "${VLLM_IMAGE}" \
+    bash -c "${BNXT_DRIVER_INSTALL} && pip install --quiet msgpack && ${VLLM_PATCH} && vllm serve '${MODEL}' \
+        --port '${DECODE_PORT}' \
+        --max-model-len '${DECODE_MAX_MODEL_LEN}' \
+        --trust-remote-code \
+        --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}' \
+        --kv-transfer-config '${DECODE_KV_CONFIG}'"
+
+docker logs -f moriio-decode 2>&1 | tee "${LOG_DIR}/decode_phase2.log" &
+
+wait_for_health "moriio-prefill" "${PREFILL_PORT}"
+wait_for_health "moriio-decode"  "${DECODE_PORT}"
 
 wait_for_toy_proxy_registrations
-
-# Stream the toy proxy log to the host log dir in the background
-docker exec moriio-prefill tail -f /tmp/toy_proxy.log \
-    > "${LOG_DIR}/toy_proxy.log" 2>&1 &
 
 echo ""
 echo ">>> Phase 2: benchmarking through toy proxy..."
@@ -514,7 +547,7 @@ echo ">>> Phase 2: benchmarking through toy proxy..."
 
 docker exec moriio-prefill \
     vllm bench serve \
-        --base-url "http://localhost:${ROUTER_PORT}" \
+        --base-url "http://localhost:${TOY_PROXY_HTTP_PORT}" \
         "${BENCH_ARGS[@]}" 2>&1 | tee -a "${BENCH_LOG}"
 
 echo ""
@@ -548,6 +581,6 @@ if [[ "${KEEP_ALIVE}" == "1" ]]; then
 else
     echo ""
     echo ">>> Shutting down containers..."
-    docker rm -f moriio-prefill moriio-decode moriio-router 2>/dev/null || true
+    docker rm -f moriio-prefill moriio-decode moriio-router moriio-toy-proxy 2>/dev/null || true
     echo "Done. All containers removed."
 fi
