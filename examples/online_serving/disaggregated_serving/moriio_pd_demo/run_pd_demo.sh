@@ -217,6 +217,14 @@ VLLM_COMMON_ARGS=(
     -e HF_HOME=/root/.cache/huggingface
     -e HF_HUB_ENABLE_HF_TRANSFER=0
     -e VLLM_MORIIO_CONNECTOR_READ_MODE=1
+    -e NCCL_MIN_NCHANNELS=112
+    -e VLLM_USE_V1=1
+    -e VLLM_ROCM_USE_AITER=1
+    -e VLLM_ROCM_USE_AITER_PAGED_ATTN=0
+    -e VLLM_ROCM_USE_AITER_RMSNORM=1
+    -e VLLM_USE_AITER_TRITON_SILU_MUL=0
+    -e VLLM_ENGINE_READY_TIMEOUT_S=3600
+    -e VLLM_SERVER_DEV_MODE=1
 )
 
 # ── Launch prefill instance ───────────────────────────────────────────────────
@@ -316,15 +324,12 @@ echo "  (Set KEEP_ALIVE=1 to leave them running.)"
 
 if [[ "${USE_GSM8K}" == "1" ]]; then
 
-# ── GSM8K two-phase accuracy comparison ───────────────────────────────────────
+# ── GSM8K two-phase accuracy comparison (via lm_eval) ────────────────────────
 # Phase 1 : vllm-router (already running)
 # Phase 2 : toy proxy  (router replaced, vLLM instances restarted)
 #
-# The eval script is present in the image at:
-#   /app/vllm/tests/evals/gsm8k/gsm8k_eval.py
-GSM8K_SCRIPT="/app/vllm/tests/evals/gsm8k/gsm8k_eval.py"
-# Host-side fallback in case the pre-built image predates tests/evals/.
-GSM8K_HOST_SCRIPT="$(cd "$(dirname "$0")/../../../.."; pwd)/tests/evals/gsm8k/gsm8k_eval.py"
+# Uses the lm_eval harness with --model local-completions so the full GSM8K
+# test set flows through whichever proxy is active.
 
 # Per-phase output paths
 GSM8K_ROUTER_LOG="${LOG_DIR}/gsm8k_results_router.log"
@@ -335,61 +340,50 @@ GSM8K_PROXY_JSON="${LOG_DIR}/gsm8k_results_toy_proxy.json"
 TOY_PROXY_CONTAINER_PATH="/app/vllm/examples/online_serving/disaggregated_serving/moriio_toy_proxy_server.py"
 TOY_PROXY_HTTP_PORT=10001
 
-# Helper: ensure gsm8k_eval.py exists in the named container, copying from
-# the host repo if needed.
-ensure_gsm8k_script() {
-    local container="$1"
-    if ! docker exec "${container}" test -f "${GSM8K_SCRIPT}" 2>/dev/null; then
-        if [[ -f "${GSM8K_HOST_SCRIPT}" ]]; then
-            echo "    gsm8k_eval.py not found in image — copying from host repo..."
-            docker exec "${container}" mkdir -p "$(dirname "${GSM8K_SCRIPT}")"
-            docker cp "${GSM8K_HOST_SCRIPT}" "${container}:${GSM8K_SCRIPT}"
-        else
-            echo "ERROR: gsm8k_eval.py not found in image or host repo (${GSM8K_HOST_SCRIPT})" >&2
-            exit 1
-        fi
-    fi
-}
-
-# Helper: run the GSM8K eval inside a container against the given port, tee
-# stdout to log_file, and copy the JSON out of the container.
-run_gsm8k() {
+# Helper: run lm_eval gsm8k inside a container against the given port.
+# Installs lm_eval[vllm] if needed, writes stdout to log_file, and copies
+# the lm_eval results JSON out of the container to json_dest.
+run_lm_eval() {
     local container="$1"
     local port="$2"
     local log_file="$3"
     local json_dest="$4"
-
-    ensure_gsm8k_script "${container}"
+    local out_dir="/tmp/lm_eval_out"
 
     docker exec "${container}" bash -c \
-        "pip install --quiet requests tqdm regex numpy && \
-         python3 ${GSM8K_SCRIPT} \
-             --host http://127.0.0.1 \
-             --port ${port} \
-             --num-questions 1319 \
-             --num-shots 5 \
-             --max-tokens 256 \
-             --temperature 0.0 \
-             --seed 42 \
-             --save-results /tmp/gsm8k_results.json" \
+        "pip install --quiet 'lm_eval[api]' && \
+         rm -rf ${out_dir} && \
+         lm_eval \
+             --model local-completions \
+             --model_args model=${MODEL},base_url=http://127.0.0.1:${port}/v1/completions,tokenized_requests=False,trust_remote_code=True \
+             --tasks gsm8k \
+             --output_path ${out_dir}" \
         2>&1 | tee -a "${log_file}"
 
-    docker cp "${container}:/tmp/gsm8k_results.json" "${json_dest}" 2>/dev/null || true
+    # lm_eval writes results.json somewhere under out_dir; find and copy it.
+    local remote_json
+    remote_json=$(docker exec "${container}" \
+        find "${out_dir}" -name "results.json" 2>/dev/null | head -1)
+    if [[ -n "${remote_json}" ]]; then
+        docker cp "${container}:${remote_json}" "${json_dest}" 2>/dev/null || true
+    else
+        echo "WARNING: lm_eval results.json not found in ${out_dir}" >&2
+    fi
 }
 
 # ── Phase 1: GSM8K through vllm-router ───────────────────────────────────────
 echo ""
-echo ">>> Phase 1: GSM8K accuracy evaluation through vllm-router..."
-echo "    (1319 questions, 5-shot, temperature=0, results → ${GSM8K_ROUTER_LOG})"
+echo ">>> Phase 1: GSM8K accuracy evaluation (lm_eval) through vllm-router..."
+echo "    (full GSM8K test set, results → ${GSM8K_ROUTER_LOG})"
 {
     echo "======================================================"
-    echo "  GSM8K evaluation — Phase 1: vllm-router"
+    echo "  GSM8K evaluation (lm_eval) — Phase 1: vllm-router"
     echo "  Model : ${MODEL}"
     echo "  Date  : $(date)"
     echo "======================================================"
 } | tee "${GSM8K_ROUTER_LOG}"
 
-run_gsm8k "moriio-prefill" "${ROUTER_PORT}" "${GSM8K_ROUTER_LOG}" "${GSM8K_ROUTER_JSON}"
+run_lm_eval "moriio-prefill" "${ROUTER_PORT}" "${GSM8K_ROUTER_LOG}" "${GSM8K_ROUTER_JSON}"
 
 # ── Phase 2: switch to toy proxy and re-run ───────────────────────────────────
 echo ""
@@ -477,28 +471,44 @@ while true; do
 done
 
 echo ""
-echo ">>> Phase 2: GSM8K accuracy evaluation through toy proxy..."
-echo "    (1319 questions, 5-shot, temperature=0, results → ${GSM8K_PROXY_LOG})"
+echo ">>> Phase 2: GSM8K accuracy evaluation (lm_eval) through toy proxy..."
+echo "    (full GSM8K test set, results → ${GSM8K_PROXY_LOG})"
 {
     echo "======================================================"
-    echo "  GSM8K evaluation — Phase 2: moriio_toy_proxy_server.py"
+    echo "  GSM8K evaluation (lm_eval) — Phase 2: moriio_toy_proxy_server.py"
     echo "  Model : ${MODEL}"
     echo "  Date  : $(date)"
     echo "======================================================"
 } | tee "${GSM8K_PROXY_LOG}"
 
-run_gsm8k "moriio-prefill" "${TOY_PROXY_HTTP_PORT}" "${GSM8K_PROXY_LOG}" "${GSM8K_PROXY_JSON}"
+run_lm_eval "moriio-prefill" "${TOY_PROXY_HTTP_PORT}" "${GSM8K_PROXY_LOG}" "${GSM8K_PROXY_JSON}"
 
 # ── Side-by-side summary ──────────────────────────────────────────────────────
+# lm_eval results.json structure:
+#   { "results": { "gsm8k": { "exact_match,flexible-extract": 0.xx, ... } } }
+_gsm8k_metric() {
+    local json_file="$1"
+    local key="$2"
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open('${json_file}'))
+    v = d['results']['gsm8k'].get('${key}', 'N/A')
+    print(f'{v:.4f}' if isinstance(v, float) else v)
+except Exception as e:
+    print('N/A')
+" 2>/dev/null || echo "N/A"
+}
+
 echo ""
 echo "=== GSM8K comparison complete ==="
 echo ""
-printf "%-30s  %s\n" "Metric" "vllm-router   toy-proxy"
-printf "%-30s  %s\n" "------" "-----------   ---------"
-for metric in accuracy invalid_responses questions_per_second output_tokens_per_second; do
-    r=$(python3 -c "import json,sys; d=json.load(open('${GSM8K_ROUTER_JSON}')); print(d.get('${metric}','N/A'))" 2>/dev/null || echo "N/A")
-    p=$(python3 -c "import json,sys; d=json.load(open('${GSM8K_PROXY_JSON}')); print(d.get('${metric}','N/A'))" 2>/dev/null || echo "N/A")
-    printf "%-30s  %-13s %s\n" "${metric}" "${r}" "${p}"
+printf "%-35s  %-15s %s\n" "Metric" "vllm-router" "toy-proxy"
+printf "%-35s  %-15s %s\n" "------" "-----------" "---------"
+for key in "exact_match,flexible-extract" "exact_match,strict-match"; do
+    r=$(_gsm8k_metric "${GSM8K_ROUTER_JSON}" "${key}")
+    p=$(_gsm8k_metric "${GSM8K_PROXY_JSON}"  "${key}")
+    printf "%-35s  %-15s %s\n" "${key}" "${r}" "${p}"
 done
 echo ""
 echo "  Phase 1 log  : ${GSM8K_ROUTER_LOG}"

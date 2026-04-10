@@ -180,15 +180,19 @@ USE_GSM8K=1 \
 ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo.sh
 ```
 
-This uses vLLM's built-in `tests/evals/gsm8k/gsm8k_eval.py` script (1 319 questions,
-5-shot, temperature=0, seed=42) and runs it **twice**:
+This uses the [`lm_eval`](https://github.com/EleutherAI/lm-evaluation-harness) harness
+with `--model local-completions` pointed at the active proxy, running the full GSM8K
+test set, and runs it **twice**:
 
 1. **Phase 1** — through `vllm-router` (services already running)
 2. **Phase 2** — vllm-router is replaced by `moriio_toy_proxy_server.py`; prefill and
    decode are restarted so they re-register with the new proxy, then the eval runs again
 
-At the end the script prints a side-by-side summary of accuracy, invalid-response rate,
-and throughput for both routers.
+`lm_eval[api]` is installed automatically inside the container before each run
+(`local-completions` is an API model backend that requires `tenacity`).
+
+At the end the script prints a side-by-side summary of `exact_match,flexible-extract`
+and `exact_match,strict-match` for both routers.
 
 Results are written to:
 
