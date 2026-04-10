@@ -58,7 +58,27 @@ RUN apt-get update -q -y && apt-get install -q -y \
     libibverbs1 \
     ibverbs-providers \
     ibverbs-utils \
+    autoconf \
+    libibverbs-dev \
+    libtool \
+    unzip \
+    wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Broadcom bnxt_re RDMA user-space driver
+RUN wget -q https://docs.broadcom.com/docs-and-downloads/ethernet-network-adapters/NXE/Thor2/GCA1/bcm5760x_230.2.52.0a.zip && \
+    unzip -q bcm5760x_230.2.52.0a.zip && \
+    cd bcm5760x_230.2.52.0a/drivers_linux/bnxt_rocelib/ && \
+    results=$(find -name "libbnxt*.tar.gz") && tar -xf $results && \
+    untar_dir=$(find . -maxdepth 1 -type d -name "libbnxt*" ! -name "*.tar.gz" | head -n 1) && \
+    cd $untar_dir && sh autogen.sh && ./configure && make && \
+    find /usr/lib64/ /usr/lib -name "libbnxt_re-rdmav*.so" -exec mv {} {}.inbox \; && \
+    make install all && \
+    sh -c "echo /usr/local/lib >> /etc/ld.so.conf" && \
+    ldconfig && \
+    cp -f bnxt_re.driver /etc/libibverbs.d/ && \
+    ibv_devices && \
+    cd / && rm -rf /bcm5760x_230.2.52.0a /bcm5760x_230.2.52.0a.zip
 
 # Install vLLM wheel and its ROCm dependencies
 RUN --mount=type=bind,from=build_vllm,src=/app/vllm,target=/vllm_src \
@@ -66,7 +86,8 @@ RUN --mount=type=bind,from=build_vllm,src=/app/vllm,target=/vllm_src \
     cd /vllm_src \
     && uv pip install --system -r requirements/rocm.txt \
     && pip uninstall -y vllm || true \
-    && uv pip install --system dist/*.whl
+    && uv pip install --system dist/*.whl \
+    && uv pip install --system msgpack
 
 # Verify ROCm PyTorch (not CUDA)
 RUN python3 -c "import torch; assert torch.version.hip is not None, \
