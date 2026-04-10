@@ -36,7 +36,7 @@ DECODE_HANDSHAKE_PORT="${DECODE_HANDSHAKE_PORT:-6302}"
 PREFILL_NOTIFY_PORT="${PREFILL_NOTIFY_PORT:-61005}"
 DECODE_NOTIFY_PORT="${DECODE_NOTIFY_PORT:-61006}"
 
-VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev}"
+VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0410-1542}"
 # Basic router (smoke-test only — no streaming support)
 ROUTER_IMAGE="${ROUTER_IMAGE:-ghcr.io/simondanielsson/vllm-router:dev}"
 # Streaming-capable router (required for USE_BENCH=1 and USE_GSM8K=1)
@@ -169,72 +169,6 @@ VLLM_COMMON_ARGS=(
     -e VLLM_MORIIO_CONNECTOR_READ_MODE=1
 )
 
-# ── Temporary: Broadcom bnxt_re RDMA driver install (runs inside each container)
-# Remove once the image is rebuilt with this baked in (see Dockerfile.vllm-rocm).
-BNXT_DRIVER_INSTALL=$(cat <<'BNXT_EOF'
-echo "--- Installing Broadcom bnxt_re RDMA driver ---"
-apt-get update -q -y && apt-get install -y -q autoconf libibverbs-dev ibverbs-utils libtool unzip wget
-cd /tmp
-wget -q https://docs.broadcom.com/docs-and-downloads/ethernet-network-adapters/NXE/Thor2/GCA1/bcm5760x_230.2.52.0a.zip
-unzip -q bcm5760x_230.2.52.0a.zip
-cd bcm5760x_230.2.52.0a/drivers_linux/bnxt_rocelib/
-results=$(find -name "libbnxt*.tar.gz")
-tar -xf $results
-untar_dir=$(find . -maxdepth 1 -type d -name "libbnxt*" ! -name "*.tar.gz" | head -n 1)
-cd $untar_dir
-sh autogen.sh && ./configure && make
-find /usr/lib64/ /usr/lib -name "libbnxt_re-rdmav*.so" -exec mv {} {}.inbox \;
-make install all
-sh -c "echo /usr/local/lib >> /etc/ld.so.conf"
-ldconfig
-cp -f bnxt_re.driver /etc/libibverbs.d/
-cd /tmp && rm -rf bcm5760x_230.2.52.0a bcm5760x_230.2.52.0a.zip
-echo "--- Broadcom driver installed successfully ---"
-BNXT_EOF
-)
-
-# ── Temporary: patch MoRIIOConstants.PING_INTERVAL in the installed vLLM wheel
-# Aligns the heartbeat with the router's DEFAULT_PING_SECONDS (5s TTL).
-# Remove once the vLLM image is rebuilt with PING_INTERVAL = 3.
-VLLM_PATCH=$(cat <<'PATCH_EOF'
-python3 -c "
-import inspect
-import vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common as m
-
-f = inspect.getfile(m)
-txt = open(f).read()
-txt = txt.replace('PING_INTERVAL = 5', 'PING_INTERVAL = 3')
-txt = txt.replace(
-    r'___decode_addr_(.+)_[0-9a-f]{32}$',
-    r'___decode_addr_(.+)_[0-9a-f]{32}(?:-.*)?$',
-)
-open(f, 'w').write(txt)
-print('Patched moriio_common.py in', f)
-"
-
-# Patch the toy proxy to avoid importing vllm (which triggers heavy GPU
-# initialisation and crashes when run as a second process in the container).
-# Replace the vllm import with an inline class that provides the same constant.
-python3 -c "
-import inspect, importlib, sys
-sys.path.insert(0, '/app/vllm')
-import examples.online_serving.disaggregated_serving.moriio_toy_proxy_server as _mod
-f = inspect.getfile(_mod)
-txt = open(f).read()
-old = '''from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
-    MoRIIOConstants,
-)'''
-new = '''class MoRIIOConstants:
-    TRANSFER_PREFIX = \"tx\"'''
-if old in txt:
-    open(f, 'w').write(txt.replace(old, new))
-    print('Patched moriio_toy_proxy_server.py in', f)
-else:
-    print('Toy proxy already patched or import not found — skipping')
-" 2>/dev/null || true
-PATCH_EOF
-)
-
 # ── Launch prefill instance ───────────────────────────────────────────────────
 echo ""
 echo ">>> Starting prefill instance (GPU ${PREFILL_GPU}, port ${PREFILL_PORT})..."
@@ -244,11 +178,11 @@ docker run -d \
     "${VLLM_COMMON_ARGS[@]}" \
     -e HIP_VISIBLE_DEVICES="${PREFILL_GPU}" \
     "${VLLM_IMAGE}" \
-    bash -c "${BNXT_DRIVER_INSTALL} && pip install --quiet msgpack && ${VLLM_PATCH} && vllm serve '${MODEL}' \
-        --port '${PREFILL_PORT}' \
-        --max-model-len '${PREFILL_MAX_MODEL_LEN}' \
+    vllm serve "${MODEL}" \
+        --port "${PREFILL_PORT}" \
+        --max-model-len "${PREFILL_MAX_MODEL_LEN}" \
         --trust-remote-code \
-        --kv-transfer-config '${PREFILL_KV_CONFIG}'"
+        --kv-transfer-config "${PREFILL_KV_CONFIG}"
 
 docker logs -f moriio-prefill 2>&1 | tee "${LOG_DIR}/prefill.log" &
 
@@ -260,12 +194,12 @@ docker run -d \
     "${VLLM_COMMON_ARGS[@]}" \
     -e HIP_VISIBLE_DEVICES="${DECODE_GPU}" \
     "${VLLM_IMAGE}" \
-    bash -c "${BNXT_DRIVER_INSTALL} && pip install --quiet msgpack && ${VLLM_PATCH} && vllm serve '${MODEL}' \
-        --port '${DECODE_PORT}' \
-        --max-model-len '${DECODE_MAX_MODEL_LEN}' \
+    vllm serve "${MODEL}" \
+        --port "${DECODE_PORT}" \
+        --max-model-len "${DECODE_MAX_MODEL_LEN}" \
         --trust-remote-code \
-        --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}' \
-        --kv-transfer-config '${DECODE_KV_CONFIG}'"
+        --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+        --kv-transfer-config "${DECODE_KV_CONFIG}"
 
 docker logs -f moriio-decode 2>&1 | tee "${LOG_DIR}/decode.log" &
 
@@ -507,11 +441,11 @@ docker run -d \
     "${VLLM_COMMON_ARGS[@]}" \
     -e HIP_VISIBLE_DEVICES="${PREFILL_GPU}" \
     "${VLLM_IMAGE}" \
-    bash -c "${BNXT_DRIVER_INSTALL} && pip install --quiet msgpack && ${VLLM_PATCH} && vllm serve '${MODEL}' \
-        --port '${PREFILL_PORT}' \
-        --max-model-len '${PREFILL_MAX_MODEL_LEN}' \
+    vllm serve "${MODEL}" \
+        --port "${PREFILL_PORT}" \
+        --max-model-len "${PREFILL_MAX_MODEL_LEN}" \
         --trust-remote-code \
-        --kv-transfer-config '${PREFILL_KV_CONFIG}'"
+        --kv-transfer-config "${PREFILL_KV_CONFIG}"
 
 docker logs -f moriio-prefill 2>&1 | tee "${LOG_DIR}/prefill_phase2.log" &
 
@@ -521,12 +455,12 @@ docker run -d \
     "${VLLM_COMMON_ARGS[@]}" \
     -e HIP_VISIBLE_DEVICES="${DECODE_GPU}" \
     "${VLLM_IMAGE}" \
-    bash -c "${BNXT_DRIVER_INSTALL} && pip install --quiet msgpack && ${VLLM_PATCH} && vllm serve '${MODEL}' \
-        --port '${DECODE_PORT}' \
-        --max-model-len '${DECODE_MAX_MODEL_LEN}' \
+    vllm serve "${MODEL}" \
+        --port "${DECODE_PORT}" \
+        --max-model-len "${DECODE_MAX_MODEL_LEN}" \
         --trust-remote-code \
-        --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}' \
-        --kv-transfer-config '${DECODE_KV_CONFIG}'"
+        --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+        --kv-transfer-config "${DECODE_KV_CONFIG}"
 
 docker logs -f moriio-decode 2>&1 | tee "${LOG_DIR}/decode_phase2.log" &
 
