@@ -164,7 +164,9 @@ IS_PREFILL=0 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> \
   ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
 ```
 
-Benchmark results are written to `~/moriio-logs/benchmark_results.log` on Node 1.
+Benchmark results (both phases) are written to `~/moriio-logs/benchmark_results.log`
+on Node 1. The decode node automatically restarts for Phase 2 — just leave Node 2's
+script running; it will poll for the Phase 2 restart signal from Node 1.
 
 ### GSM8K accuracy evaluation (`USE_GSM8K=1`)
 
@@ -182,12 +184,11 @@ IS_PREFILL=0 PREFILL_IP=<node1-ip> DECODE_IP=<node2-ip> \
   ./examples/online_serving/disaggregated_serving/moriio_pd_demo/run_pd_demo_2node.sh
 ```
 
-GSM8K results are written to `~/moriio-logs/gsm8k_results_router.log` (and `.json`)
-on Node 1.
+GSM8K results are written to `~/moriio-logs/gsm8k_results.log` (and `.json`) on Node 1.
 
-> **Note:** The two-node script does not support the toy-proxy phase (`USE_BENCH` only
-> runs Phase 1 via vllm-router). `USE_GSM8K=1` and `USE_BENCH=1` are mutually exclusive
-> — GSM8K takes priority if both are set.
+> **Note:** `USE_GSM8K=1` and `USE_BENCH=1` are mutually exclusive — GSM8K takes priority
+> if both are set. The GSM8K eval runs only through vllm-router (single-phase); the toy
+> proxy comparison in 2-node mode is not yet supported for GSM8K.
 
 Environment variables for `run_pd_demo_2node.sh`:
 
@@ -207,6 +208,7 @@ Environment variables for `run_pd_demo_2node.sh`:
 | `USE_GSM8K` | `0` | Set to `1` to run the GSM8K accuracy evaluation |
 | `KEEP_ALIVE` | `0` | Set to `1` to leave containers running after the script exits |
 | `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127` | vLLM Docker image |
+| `PHASE2_SIGNAL_PORT` | `19876` | Port on Node 1 used to signal Node 2 to restart for Phase 2 (`USE_BENCH=1`) |
 | `ROUTER_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev` | Router image (smoke test) |
 | `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy` | Router image for bench/eval |
 
