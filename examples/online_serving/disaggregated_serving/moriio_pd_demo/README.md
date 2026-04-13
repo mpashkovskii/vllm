@@ -48,7 +48,7 @@ docker build \
     .
 
 # To build the image with mori support + streaming: this branch contains the two PR's on top of each other
-git switch reprod/moriio-support-and-streaming
+git switch tmp/transfer_id-and-streaming
 docker build \
     -f <path-to-this-dir>/Dockerfile.router \
     -t ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy \
