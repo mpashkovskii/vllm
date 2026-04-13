@@ -28,8 +28,8 @@ MoRIIOConnector KV connector and the vllm-router.
 docker pull ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127
 # Basic router support, i.e. PR https://github.com/vllm-project/router/pull/138
 docker pull ghcr.io/simondanielsson/vllm-router:dev
-# Basic router support + streaming, i.e. both PRs https://github.com/vllm-project/router/pull/138 and https://github.com/vllm-project/router/pull/139
-docker pull ghcr.io/simondanielsson/vllm-router:dev-streaming
+# Basic router support + streaming, i.e. both PRs https://github.com/vllm-project/router/pull/138 and https://github.com/vllm-project/router/pull/114
+docker pull ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy
 ```
 
 ### Option B — Build from source
@@ -51,7 +51,7 @@ docker build \
 git switch reprod/moriio-support-and-streaming
 docker build \
     -f <path-to-this-dir>/Dockerfile.router \
-    -t ghcr.io/simondanielsson/vllm-router:dev-streaming \
+    -t ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy \
     .
 ```
 
@@ -120,7 +120,7 @@ Environment variables:
 | `KEEP_ALIVE` | `0` | Set to `1` to leave containers running after the script exits |
 | `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127` | vLLM Docker image name |
 | `ROUTER_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev` | Router image used for smoke-test (no streaming) |
-| `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming` | Router image used for `USE_BENCH=1` / `USE_GSM8K=1` (streaming support required) |
+| `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy` | Router image used for `USE_BENCH=1` / `USE_GSM8K=1` (streaming support required) |
 
 ---
 
@@ -208,7 +208,7 @@ Environment variables for `run_pd_demo_2node.sh`:
 | `KEEP_ALIVE` | `0` | Set to `1` to leave containers running after the script exits |
 | `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127` | vLLM Docker image |
 | `ROUTER_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev` | Router image (smoke test) |
-| `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming` | Router image for bench/eval |
+| `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy` | Router image for bench/eval |
 
 ---
 
