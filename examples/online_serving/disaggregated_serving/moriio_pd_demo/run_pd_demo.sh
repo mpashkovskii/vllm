@@ -36,7 +36,7 @@ DECODE_HANDSHAKE_PORT="${DECODE_HANDSHAKE_PORT:-6302}"
 PREFILL_NOTIFY_PORT="${PREFILL_NOTIFY_PORT:-61005}"
 DECODE_NOTIFY_PORT="${DECODE_NOTIFY_PORT:-61006}"
 
-VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0410-1542}"
+VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127}"
 # Basic router (smoke-test only — no streaming support)
 ROUTER_IMAGE="${ROUTER_IMAGE:-ghcr.io/simondanielsson/vllm-router:dev}"
 # Streaming-capable router (required for USE_BENCH=1 and USE_GSM8K=1)
