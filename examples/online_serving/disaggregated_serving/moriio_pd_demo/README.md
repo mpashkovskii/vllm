@@ -74,7 +74,7 @@ The vLLM build compiles the ROCm wheel from source, which takes a while.
 
 ---
 
-## 2. Run the demo
+## 2. Run the demo, single node
 
 ### PR 1 — basic PD-disaggregation (smoke test only to confirm everything works)
 
