@@ -158,7 +158,7 @@ PREFILL_EXTRA_ARGS=(
 DECODE_EXTRA_ARGS=(
     --enable-expert-parallel
     --all2all-backend mori
-    --enforce-eager
+    --compilation-config '{"cudagraph_mode": "PIECEWISE"}'
 )
 
 # ── KV-transfer configs ───────────────────────────────────────────────────────
@@ -219,12 +219,13 @@ VLLM_COMMON_ARGS=(
     -e VLLM_MORIIO_CONNECTOR_READ_MODE=1
     -e NCCL_MIN_NCHANNELS=112
     -e VLLM_USE_V1=1
+    -e VLLM_ENGINE_READY_TIMEOUT_S=3600
+    -e VLLM_SERVER_DEV_MODE=1
     -e VLLM_ROCM_USE_AITER=1
     -e VLLM_ROCM_USE_AITER_PAGED_ATTN=0
     -e VLLM_ROCM_USE_AITER_RMSNORM=1
     -e VLLM_USE_AITER_TRITON_SILU_MUL=0
-    -e VLLM_ENGINE_READY_TIMEOUT_S=3600
-    -e VLLM_SERVER_DEV_MODE=1
+    
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
