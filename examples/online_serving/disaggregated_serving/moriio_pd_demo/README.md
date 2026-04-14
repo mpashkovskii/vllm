@@ -24,8 +24,8 @@ MoRIIOConnector KV connector and the vllm-router.
 ### Option A — Pull pre-built images (recommended)
 
 ```bash
-# Built from vllm PR https://github.com/vllm-project/vllm/pull/39565, commit ab589834e2ce405d0c994bf0d6d3517c14a2e189
-docker pull ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127
+# Built from vllm PR https://github.com/vllm-project/vllm/pull/39565, commit 619af871380a7c72876f17101a2f9384fd959cff
+docker pull ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0414-0859
 # Basic router support, i.e. PR https://github.com/vllm-project/router/pull/138
 docker pull ghcr.io/simondanielsson/vllm-router:dev
 # Basic router support + streaming, i.e. both PRs https://github.com/vllm-project/router/pull/138 and https://github.com/vllm-project/router/pull/114
@@ -118,7 +118,7 @@ Environment variables:
 | `USE_BENCH` | `0` | Set to `1` to run the full perf benchmark (requires streaming support) |
 | `USE_GSM8K` | `0` | Set to `1` to run a GSM8K accuracy evaluation instead of the perf benchmark |
 | `KEEP_ALIVE` | `0` | Set to `1` to leave containers running after the script exits |
-| `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127` | vLLM Docker image name |
+| `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0414-0859` | vLLM Docker image name |
 | `ROUTER_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev` | Router image used for smoke-test (no streaming) |
 | `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy` | Router image used for `USE_BENCH=1` / `USE_GSM8K=1` (streaming support required) |
 
@@ -207,7 +207,7 @@ Environment variables for `run_pd_demo_2node.sh`:
 | `USE_BENCH` | `0` | Set to `1` to run the perf benchmark after startup |
 | `USE_GSM8K` | `0` | Set to `1` to run the GSM8K accuracy evaluation |
 | `KEEP_ALIVE` | `0` | Set to `1` to leave containers running after the script exits |
-| `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127` | vLLM Docker image |
+| `VLLM_IMAGE` | `ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0414-0859` | vLLM Docker image |
 | `PHASE2_SIGNAL_PORT` | `19876` | Port on Node 1 used to signal Node 2 to restart for Phase 2 (`USE_BENCH=1`) |
 | `ROUTER_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev` | Router image (smoke test) |
 | `ROUTER_STREAMING_IMAGE` | `ghcr.io/simondanielsson/vllm-router:dev-streaming-cn-cjy` | Router image for bench/eval |

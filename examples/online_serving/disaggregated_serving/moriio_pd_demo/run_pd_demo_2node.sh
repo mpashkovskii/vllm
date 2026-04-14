@@ -13,7 +13,7 @@
 #
 # Prerequisites
 #   • 8 ROCm GPUs on each node
-#   • Docker image pulled: ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127
+#   • Docker image pulled: ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0414-0859
 #   • Router image pulled: ghcr.io/simondanielsson/vllm-router:dev (or :dev-streaming-cn-cjy)
 #   • RDMA / InfiniBand devices visible at /dev/infiniband on each node
 #   • Ports PREFILL_PORT, DECODE_PORT, ROUTER_PORT, PROXY_PING_PORT,
@@ -65,7 +65,7 @@ NOTIFY_PORT="${NOTIFY_PORT:-61005}"       # Prefill↔decode stage synchronisati
 # The prefill node starts a simple HTTP server on this port; the decode node polls it.
 PHASE2_SIGNAL_PORT="${PHASE2_SIGNAL_PORT:-19876}"
 
-VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0411-1127}"
+VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0414-0859}"
 # Basic router (smoke-test only — no streaming support)
 ROUTER_IMAGE="${ROUTER_IMAGE:-ghcr.io/simondanielsson/vllm-router:dev}"
 # Streaming-capable router (required for USE_BENCH=1 and USE_GSM8K=1)
