@@ -61,11 +61,12 @@ Build from the **root of this vllm repo**:
 
 ```bash
 # clone the fork
-git clone git@github.com:mpashkovskii/vllm.git
+git clone git@github.com:simondanielsson/vllm.git # vllm branc here
+git clone git@github.com:mpashkov/vllm.git path/to/mpashkov-vllm-fork/ # reproducer in this fork, alt. just set multiple remotes
 cd vllm
-git switch fix/moriio-sane-defaults
+git switch fix/align-mori-messages
 docker build \
-    -f examples/online_serving/disaggregated_serving/moriio_pd_demo/Dockerfile.vllm-rocm \
+    -f path/to/mpashkov-vllm-fork/examples/online_serving/disaggregated_serving/moriio_pd_demo/Dockerfile.vllm-rocm \
     -t ghcr.io/simondanielsson/vllm-rocm-moriio:dev \
     .
 ```

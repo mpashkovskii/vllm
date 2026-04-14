@@ -19,7 +19,7 @@
 #   • Ports PREFILL_PORT, DECODE_PORT, ROUTER_PORT, PROXY_PING_PORT,
 #     HANDSHAKE_PORT, NOTIFY_PORT, PHASE2_SIGNAL_PORT open between the two nodes
 #
-# Phase 2 coordination (USE_BENCH=1 only)
+# Phase 2 coordination (USE_BENCH=1 or USE_GSM8K=1)
 #   The prefill node starts a tiny HTTP signal server on PHASE2_SIGNAL_PORT
 #   after Phase 1 completes.  The decode node polls that port; once it gets a
 #   response it tears down its container and restarts so the new instance
@@ -141,7 +141,6 @@ PYEOF
 VLLM_SERVE_ARGS=(
     --tensor-parallel-size 8
     --kv-cache-dtype fp8
-    --load-format dummy
     --gpu-memory-utilization 0.7
     --max-num-batched-tokens 32768
     --max-model-len 16384
@@ -232,7 +231,7 @@ VLLM_COMMON_ARGS=(
 wait_for_health() {
     local name="$1"
     local url="$2"
-    local max_wait="${3:-600}"
+    local max_wait="${3:-1800}"
     local interval=10
     local elapsed=0
 
@@ -252,225 +251,31 @@ wait_for_health() {
     done
 }
 
-# ── Cleanup trap ──────────────────────────────────────────────────────────────
-_cleanup() {
-    if [[ "${KEEP_ALIVE}" == "1" ]]; then
-        echo ""
-        echo "KEEP_ALIVE=1 — containers left running."
-        if [[ "${IS_PREFILL}" == "1" ]]; then
-            echo "  To tear down: docker rm -f moriio-prefill moriio-router moriio-toy-proxy"
-        else
-            echo "  To tear down: docker rm -f moriio-decode"
+# Poll docker logs until both P and D have registered with the toy proxy.
+wait_for_toy_proxy_registrations() {
+    local max_wait=120 interval=3 elapsed=0
+    echo "Waiting for prefill and decode to register with toy proxy..."
+    while true; do
+        local p d
+        p=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Prefill" || true)
+        d=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Decode"  || true)
+        if [[ "${p:-0}" -ge 1 && "${d:-0}" -ge 1 ]]; then
+            echo "  Both instances registered (prefill=${p} decode=${d})."
+            return 0
         fi
-        return
-    fi
-    echo ""
-    echo ">>> Shutting down containers..."
-    if [[ "${IS_PREFILL}" == "1" ]]; then
-        docker rm -f moriio-prefill moriio-router moriio-toy-proxy 2>/dev/null || true
-    else
-        docker rm -f moriio-decode 2>/dev/null || true
-    fi
-    echo "Done."
+        sleep "${interval}"
+        elapsed=$((elapsed + interval))
+        if [[ "${elapsed}" -ge "${max_wait}" ]]; then
+            echo "WARNING: timed out waiting for toy proxy registrations after ${max_wait}s" >&2
+            return 0
+        fi
+        echo "  Still waiting (${elapsed}s / ${max_wait}s) — prefill=${p:-0} decode=${d:-0}..."
+    done
 }
-trap _cleanup EXIT
 
-# ── Remove stale containers ───────────────────────────────────────────────────
-if [[ "${IS_PREFILL}" == "1" ]]; then
-    _stale_containers=(moriio-prefill moriio-router moriio-toy-proxy)
-else
-    _stale_containers=(moriio-decode)
-fi
-for cname in "${_stale_containers[@]}"; do
-    if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
-        echo "Removing existing container: ${cname}"
-        docker rm -f "${cname}"
-    fi
-done
-
-# ── Print summary ─────────────────────────────────────────────────────────────
-_role="$([ "${IS_PREFILL}" == "1" ] && echo "prefill + router" || echo "decode")"
-echo "=== MoRIIO PD disaggregation demo (2-node) ==="
-echo "  Model       : ${MODEL}"
-echo "  This node   : ${_role}"
-echo "  Prefill     : http://${PREFILL_IP}:${PREFILL_PORT}"
-echo "  Decode      : http://${DECODE_IP}:${DECODE_PORT}"
-echo "  Router      : http://${PREFILL_IP}:${ROUTER_PORT}  (prefill node)"
-echo "  Discovery   : ${PREFILL_IP}:${PROXY_PING_PORT}"
-echo "  MoRIIO ports: handshake=${HANDSHAKE_PORT}  notify=${NOTIFY_PORT}"
-echo "  Phase2 sig  : ${PREFILL_IP}:${PHASE2_SIGNAL_PORT}  (USE_BENCH=1 only)"
-echo "  Log dir     : ${LOG_DIR}"
-echo ""
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PREFILL NODE
-# ═══════════════════════════════════════════════════════════════════════════════
-if [[ "${IS_PREFILL}" == "1" ]]; then
-
-echo ">>> Starting prefill instance (port ${PREFILL_PORT})..."
-docker run -d \
-    --name moriio-prefill \
-    "${VLLM_COMMON_ARGS[@]}" \
-    "${VLLM_IMAGE}" \
-    vllm serve "${MODEL}" \
-        --port "${PREFILL_PORT}" \
-        "${VLLM_SERVE_ARGS[@]}" \
-        "${PREFILL_EXTRA_ARGS[@]}" \
-        --kv-transfer-config "${PREFILL_KV_CONFIG}"
-
-docker logs -f moriio-prefill 2>&1 | tee "${LOG_DIR}/prefill.log" &
-
-wait_for_health "moriio-prefill" "http://localhost:${PREFILL_PORT}/health" 600
-
-# ── Launch vllm-router ────────────────────────────────────────────────────────
-if [[ "${USE_BENCH}" == "1" || "${USE_GSM8K}" == "1" ]]; then
-    _ACTIVE_ROUTER_IMAGE="${ROUTER_STREAMING_IMAGE}"
-else
-    _ACTIVE_ROUTER_IMAGE="${ROUTER_IMAGE}"
-fi
-
-echo ""
-echo ">>> Starting vllm-router (port ${ROUTER_PORT}, discovery port ${PROXY_PING_PORT})..."
-echo "    Image: ${_ACTIVE_ROUTER_IMAGE}"
-docker run -d \
-    --name moriio-router \
-    --network host \
-    "${_ACTIVE_ROUTER_IMAGE}" \
-    vllm-router \
-        --vllm-pd-disaggregation \
-        --vllm-discovery-address "0.0.0.0:${PROXY_PING_PORT}" \
-        --port "${ROUTER_PORT}" \
-        --host 0.0.0.0 \
-        --policy consistent_hash \
-        --prefill-policy consistent_hash \
-        --decode-policy consistent_hash \
-        --log-level info
-
-docker logs -f moriio-router 2>&1 | tee "${LOG_DIR}/router.log" &
-
-# ── Wait for the decode node to be healthy (cross-node health check) ──────────
-echo ""
-echo ">>> Waiting for decode node (${DECODE_IP}:${DECODE_PORT}) to become healthy..."
-echo "    Start the decode node now if you haven't already."
-wait_for_health "moriio-decode (remote)" "http://${DECODE_IP}:${DECODE_PORT}/health" 1200
-
-# Brief pause for the decode instance to register with the router via ZMQ.
-echo "Waiting 10s for decode instance to register with the router..."
-sleep 10
-
-# ── Summary ───────────────────────────────────────────────────────────────────
-echo ""
-echo "=== All services ready ==="
-echo "  Prefill  : http://localhost:${PREFILL_PORT}"
-echo "  Decode   : http://${DECODE_IP}:${DECODE_PORT}"
-echo "  Router   : http://localhost:${ROUTER_PORT}  ← send requests here"
-echo ""
-echo "To follow logs (written to ${LOG_DIR}):"
-echo "  tail -f ${LOG_DIR}/prefill.log"
-echo "  tail -f ${LOG_DIR}/router.log"
-echo ""
-echo "Containers will be shut down automatically when this script exits."
-echo "(Set KEEP_ALIVE=1 to leave them running.)"
-
-# ── Smoke test / benchmark ────────────────────────────────────────────────────
-if [[ "${USE_GSM8K}" == "1" ]]; then
-
-    # Note: only a single-phase eval against vllm-router is run here.
-    # The toy proxy comparison requires restarting the decode instance on the
-    # remote node, which is not supported in 2-node mode.
-    GSM8K_LOG="${LOG_DIR}/gsm8k_results.log"
-    GSM8K_JSON="${LOG_DIR}/gsm8k_results.json"
-    _out_dir="/tmp/lm_eval_out"
-
-    echo ""
-    echo ">>> Running GSM8K accuracy evaluation (lm_eval) through vllm-router..."
-    {
-        echo "======================================================"
-        echo "  GSM8K evaluation (lm_eval) via MoRIIO PD-disaggregation (2-node)"
-        echo "  Model : ${MODEL}"
-        echo "  Date  : $(date)"
-        echo "======================================================"
-    } | tee "${GSM8K_LOG}"
-
-    docker exec moriio-prefill bash -c \
-        "pip install --quiet 'lm_eval[api]' && \
-         rm -rf ${_out_dir} && \
-         lm_eval \
-             --model local-completions \
-             --model_args model=${MODEL},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/completions,tokenized_requests=False,trust_remote_code=True \
-             --tasks gsm8k \
-             --output_path ${_out_dir}" \
-        2>&1 | tee -a "${GSM8K_LOG}"
-
-    _remote_json=$(docker exec moriio-prefill \
-        find "${_out_dir}" -name "results.json" 2>/dev/null | head -1)
-    if [[ -n "${_remote_json}" ]]; then
-        docker cp "moriio-prefill:${_remote_json}" "${GSM8K_JSON}" 2>/dev/null || true
-    else
-        echo "WARNING: lm_eval results.json not found in ${_out_dir}" >&2
-    fi
-
-    echo ""
-    echo "=== GSM8K evaluation complete ==="
-    echo "  Log  : ${GSM8K_LOG}"
-    echo "  JSON : ${GSM8K_JSON}"
-
-elif [[ "${USE_BENCH}" == "1" ]]; then
-
-    BENCH_LOG="${LOG_DIR}/benchmark_results.log"
-
-    BENCH_ARGS=(
-        --backend vllm
-        --model "${MODEL}"
-        --dataset-name random
-        --random-input-len 1000
-        --random-output-len 1000
-        --max-concurrency "${BENCH_MAX_CONCURRENCY}"
-        --num-warmups "${BENCH_NUM_WARMUPS}"
-        --num-prompts "${BENCH_NUM_PROMPTS}"
-        --ready_check_timeout_sec 3000
-        --seed 1234
-    )
-
-    # Helper: poll docker logs until both P and D have registered with the toy proxy.
-    wait_for_toy_proxy_registrations() {
-        local max_wait=120 interval=3 elapsed=0
-        echo "Waiting for prefill and decode to register with toy proxy..."
-        while true; do
-            local p d
-            p=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Prefill" || true)
-            d=$(docker logs moriio-toy-proxy 2>&1 | grep -c "Registered Decode"  || true)
-            if [[ "${p:-0}" -ge 1 && "${d:-0}" -ge 1 ]]; then
-                echo "  Both instances registered (prefill=${p} decode=${d})."
-                return 0
-            fi
-            sleep "${interval}"
-            elapsed=$((elapsed + interval))
-            if [[ "${elapsed}" -ge "${max_wait}" ]]; then
-                echo "WARNING: timed out waiting for toy proxy registrations after ${max_wait}s" >&2
-                return 0
-            fi
-            echo "  Still waiting (${elapsed}s / ${max_wait}s) — prefill=${p:-0} decode=${d:-0}..."
-        done
-    }
-
-    # ── Phase 1: benchmark through vllm-router ────────────────────────────────
-    echo ""
-    echo ">>> Phase 1: benchmarking through vllm-router..."
-    {
-        echo "======================================================"
-        echo "  Router: vllm-router (2-node)"
-        echo "  Model : ${MODEL}"
-        echo "  Date  : $(date)"
-        echo "======================================================"
-    } | tee "${BENCH_LOG}"
-
-    docker exec moriio-prefill \
-        vllm bench serve \
-            --base-url "http://localhost:${ROUTER_PORT}" \
-            "${BENCH_ARGS[@]}" 2>&1 | tee -a "${BENCH_LOG}"
-
-    # ── Phase 2: switch to toy proxy and benchmark again ──────────────────────
+# Stop router+prefill, launch toy proxy, restart prefill, wait for decode Phase 2.
+# Called by both USE_BENCH and USE_GSM8K after Phase 1 completes.
+run_phase2_switchover() {
     # Signal the decode node to restart by serving a one-line HTTP response on
     # PHASE2_SIGNAL_PORT.  We use a Python one-liner so the response is proper
     # HTTP (nc -l alone sends no headers and some curl versions reject it).
@@ -546,7 +351,7 @@ with socketserver.TCPServer(('0.0.0.0', ${PHASE2_SIGNAL_PORT}), Handler) as srv:
 
     docker logs -f moriio-prefill 2>&1 | tee "${LOG_DIR}/prefill_phase2.log" &
 
-    wait_for_health "moriio-prefill" "http://localhost:${PREFILL_PORT}/health" 600
+    wait_for_health "moriio-prefill" "http://localhost:${PREFILL_PORT}/health" 1800
 
     # Kill the signal server now that decode has been notified (it may already be gone).
     kill "${_SIGNAL_PID}" 2>/dev/null || true
@@ -560,6 +365,255 @@ with socketserver.TCPServer(('0.0.0.0', ${PHASE2_SIGNAL_PORT}), Handler) as srv:
     sleep 10
 
     wait_for_toy_proxy_registrations
+}
+
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+_cleanup() {
+    if [[ "${KEEP_ALIVE}" == "1" ]]; then
+        echo ""
+        echo "KEEP_ALIVE=1 — containers left running."
+        if [[ "${IS_PREFILL}" == "1" ]]; then
+            echo "  To tear down: docker rm -f moriio-prefill moriio-router moriio-toy-proxy"
+        else
+            echo "  To tear down: docker rm -f moriio-decode"
+        fi
+        return
+    fi
+    echo ""
+    echo ">>> Shutting down containers..."
+    if [[ "${IS_PREFILL}" == "1" ]]; then
+        docker rm -f moriio-prefill moriio-router moriio-toy-proxy 2>/dev/null || true
+    else
+        docker rm -f moriio-decode 2>/dev/null || true
+    fi
+    echo "Done."
+}
+trap _cleanup EXIT
+
+# ── Remove stale containers ───────────────────────────────────────────────────
+if [[ "${IS_PREFILL}" == "1" ]]; then
+    _stale_containers=(moriio-prefill moriio-router moriio-toy-proxy)
+else
+    _stale_containers=(moriio-decode)
+fi
+for cname in "${_stale_containers[@]}"; do
+    if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
+        echo "Removing existing container: ${cname}"
+        docker rm -f "${cname}"
+    fi
+done
+
+# ── Print summary ─────────────────────────────────────────────────────────────
+_role="$([ "${IS_PREFILL}" == "1" ] && echo "prefill + router" || echo "decode")"
+echo "=== MoRIIO PD disaggregation demo (2-node) ==="
+echo "  Model       : ${MODEL}"
+echo "  This node   : ${_role}"
+echo "  Prefill     : http://${PREFILL_IP}:${PREFILL_PORT}"
+echo "  Decode      : http://${DECODE_IP}:${DECODE_PORT}"
+echo "  Router      : http://${PREFILL_IP}:${ROUTER_PORT}  (prefill node)"
+echo "  Discovery   : ${PREFILL_IP}:${PROXY_PING_PORT}"
+echo "  MoRIIO ports: handshake=${HANDSHAKE_PORT}  notify=${NOTIFY_PORT}"
+echo "  Phase2 sig  : ${PREFILL_IP}:${PHASE2_SIGNAL_PORT}  (USE_BENCH=1 or USE_GSM8K=1)"
+echo "  Log dir     : ${LOG_DIR}"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PREFILL NODE
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ "${IS_PREFILL}" == "1" ]]; then
+
+echo ">>> Starting prefill instance (port ${PREFILL_PORT})..."
+docker run -d \
+    --name moriio-prefill \
+    "${VLLM_COMMON_ARGS[@]}" \
+    "${VLLM_IMAGE}" \
+    vllm serve "${MODEL}" \
+        --port "${PREFILL_PORT}" \
+        "${VLLM_SERVE_ARGS[@]}" \
+        "${PREFILL_EXTRA_ARGS[@]}" \
+        --kv-transfer-config "${PREFILL_KV_CONFIG}"
+
+docker logs -f moriio-prefill 2>&1 | tee "${LOG_DIR}/prefill.log" &
+
+wait_for_health "moriio-prefill" "http://localhost:${PREFILL_PORT}/health" 1800
+
+# ── Launch vllm-router ────────────────────────────────────────────────────────
+if [[ "${USE_BENCH}" == "1" || "${USE_GSM8K}" == "1" ]]; then
+    _ACTIVE_ROUTER_IMAGE="${ROUTER_STREAMING_IMAGE}"
+else
+    _ACTIVE_ROUTER_IMAGE="${ROUTER_IMAGE}"
+fi
+
+echo ""
+echo ">>> Starting vllm-router (port ${ROUTER_PORT}, discovery port ${PROXY_PING_PORT})..."
+echo "    Image: ${_ACTIVE_ROUTER_IMAGE}"
+docker run -d \
+    --name moriio-router \
+    --network host \
+    "${_ACTIVE_ROUTER_IMAGE}" \
+    vllm-router \
+        --vllm-pd-disaggregation \
+        --vllm-discovery-address "0.0.0.0:${PROXY_PING_PORT}" \
+        --port "${ROUTER_PORT}" \
+        --host 0.0.0.0 \
+        --policy consistent_hash \
+        --prefill-policy consistent_hash \
+        --decode-policy consistent_hash \
+        --log-level info
+
+docker logs -f moriio-router 2>&1 | tee "${LOG_DIR}/router.log" &
+
+# ── Wait for the decode node to be healthy (cross-node health check) ──────────
+echo ""
+echo ">>> Waiting for decode node (${DECODE_IP}:${DECODE_PORT}) to become healthy..."
+echo "    Start the decode node now if you haven't already."
+wait_for_health "moriio-decode (remote)" "http://${DECODE_IP}:${DECODE_PORT}/health" 1200
+
+# Brief pause for the decode instance to register with the router via ZMQ.
+echo "Waiting 10s for decode instance to register with the router..."
+sleep 10
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo "=== All services ready ==="
+echo "  Prefill  : http://localhost:${PREFILL_PORT}"
+echo "  Decode   : http://${DECODE_IP}:${DECODE_PORT}"
+echo "  Router   : http://localhost:${ROUTER_PORT}  ← send requests here"
+echo ""
+echo "To follow logs (written to ${LOG_DIR}):"
+echo "  tail -f ${LOG_DIR}/prefill.log"
+echo "  tail -f ${LOG_DIR}/router.log"
+echo ""
+echo "Containers will be shut down automatically when this script exits."
+echo "(Set KEEP_ALIVE=1 to leave them running.)"
+
+# ── Smoke test / benchmark ────────────────────────────────────────────────────
+if [[ "${USE_GSM8K}" == "1" ]]; then
+
+    GSM8K_LOG="${LOG_DIR}/gsm8k_results.log"
+    GSM8K_JSON_ROUTER="${LOG_DIR}/gsm8k_results_router.json"
+    GSM8K_JSON_PROXY="${LOG_DIR}/gsm8k_results_proxy.json"
+    _out_dir="/tmp/lm_eval_out"
+
+    _run_lm_eval() {
+        local base_url="$1"
+        docker exec moriio-prefill bash -c \
+            "pip install --quiet 'lm_eval[api]' && \
+             rm -rf ${_out_dir} && \
+             lm_eval \
+                 --model local-completions \
+                 --model_args model=${MODEL},base_url=${base_url}/v1/completions,tokenized_requests=False,trust_remote_code=True \
+                 --tasks gsm8k \
+                 --output_path ${_out_dir}" \
+            2>&1 | tee -a "${GSM8K_LOG}"
+    }
+
+    _save_lm_eval_json() {
+        local dest="$1"
+        local _remote_json
+        _remote_json=$(docker exec moriio-prefill \
+            find "${_out_dir}" -name "results.json" 2>/dev/null | head -1)
+        if [[ -n "${_remote_json}" ]]; then
+            docker cp "moriio-prefill:${_remote_json}" "${dest}" 2>/dev/null || true
+        else
+            echo "WARNING: lm_eval results.json not found in ${_out_dir}" >&2
+        fi
+    }
+
+    if [[ "${GSM8K_PHASE2_ONLY:-0}" != "1" ]]; then
+        # ── Phase 1: GSM8K through vllm-router ───────────────────────────────────
+        echo ""
+        echo ">>> Phase 1: running GSM8K accuracy evaluation (lm_eval) through vllm-router..."
+        {
+            echo "======================================================"
+            echo "  GSM8K evaluation (lm_eval) via MoRIIO PD-disaggregation (2-node)"
+            echo "  Router: vllm-router"
+            echo "  Model : ${MODEL}"
+            echo "  Date  : $(date)"
+            echo "======================================================"
+        } | tee "${GSM8K_LOG}"
+
+        _run_lm_eval "http://127.0.0.1:${ROUTER_PORT}"
+        _save_lm_eval_json "${GSM8K_JSON_ROUTER}"
+
+        # ── Phase 2: switch to toy proxy ──────────────────────────────────────────
+        run_phase2_switchover
+    else
+        echo ""
+        echo ">>> GSM8K_PHASE2_ONLY=1: skipping Phase 1 (vllm-router) and running switchover."
+        {
+            echo "======================================================"
+            echo "  GSM8K evaluation (lm_eval) via MoRIIO PD-disaggregation (2-node)"
+            echo "  (Phase 2 only run)"
+            echo "  Date  : $(date)"
+            echo "======================================================"
+        } | tee "${GSM8K_LOG}"
+
+        # The switchover must still happen: it stops the router + prefill (freeing
+        # PROXY_PING_PORT so the toy proxy's ZMQ listener can bind), starts the toy
+        # proxy, restarts prefill, and waits for decode to re-register.
+        run_phase2_switchover
+    fi
+
+    # ── Phase 2: GSM8K through toy proxy ─────────────────────────────────────
+    echo ""
+    echo ">>> Phase 2: running GSM8K accuracy evaluation (lm_eval) through toy proxy..."
+    {
+        echo ""
+        echo "======================================================"
+        echo "  GSM8K evaluation (lm_eval) via MoRIIO PD-disaggregation (2-node)"
+        echo "  Router: moriio_toy_proxy_server.py"
+        echo "  Model : ${MODEL}"
+        echo "  Date  : $(date)"
+        echo "======================================================"
+    } | tee -a "${GSM8K_LOG}"
+
+    _run_lm_eval "http://127.0.0.1:${TOY_PROXY_HTTP_PORT}"
+    _save_lm_eval_json "${GSM8K_JSON_PROXY}"
+
+    echo ""
+    echo "=== GSM8K evaluation complete ==="
+    echo "  Log        : ${GSM8K_LOG}"
+    if [[ "${GSM8K_PHASE2_ONLY:-0}" != "1" ]]; then
+        echo "  Router JSON: ${GSM8K_JSON_ROUTER}"
+    fi
+    echo "  Proxy JSON : ${GSM8K_JSON_PROXY}"
+
+elif [[ "${USE_BENCH}" == "1" ]]; then
+
+    BENCH_LOG="${LOG_DIR}/benchmark_results.log"
+
+    BENCH_ARGS=(
+        --backend vllm
+        --model "${MODEL}"
+        --dataset-name random
+        --random-input-len 1000
+        --random-output-len 1000
+        --max-concurrency "${BENCH_MAX_CONCURRENCY}"
+        --num-warmups "${BENCH_NUM_WARMUPS}"
+        --num-prompts "${BENCH_NUM_PROMPTS}"
+        --ready_check_timeout_sec 3000
+        --seed 1234
+    )
+
+    # ── Phase 1: benchmark through vllm-router ────────────────────────────────
+    echo ""
+    echo ">>> Phase 1: benchmarking through vllm-router..."
+    {
+        echo "======================================================"
+        echo "  Router: vllm-router (2-node)"
+        echo "  Model : ${MODEL}"
+        echo "  Date  : $(date)"
+        echo "======================================================"
+    } | tee "${BENCH_LOG}"
+
+    docker exec moriio-prefill \
+        vllm bench serve \
+            --base-url "http://localhost:${ROUTER_PORT}" \
+            "${BENCH_ARGS[@]}" 2>&1 | tee -a "${BENCH_LOG}"
+
+    # ── Phase 2: switch to toy proxy and benchmark again ──────────────────────
+    run_phase2_switchover
 
     echo ""
     echo ">>> Phase 2: benchmarking through toy proxy (HTTP port ${TOY_PROXY_HTTP_PORT})..."
@@ -623,7 +677,7 @@ start_decode() {
 echo ">>> Starting decode instance (port ${DECODE_PORT})..."
 start_decode ""
 
-wait_for_health "moriio-decode" "http://localhost:${DECODE_PORT}/health" 600
+wait_for_health "moriio-decode" "http://localhost:${DECODE_PORT}/health" 1800
 
 echo ""
 echo "=== Decode instance is healthy and registered with router on ${PREFILL_IP} ==="
@@ -634,9 +688,9 @@ echo "To follow logs:"
 echo "  tail -f ${LOG_DIR}/decode.log"
 echo ""
 
-if [[ "${USE_BENCH}" == "1" ]]; then
+if [[ "${USE_BENCH}" == "1" || "${USE_GSM8K}" == "1" ]]; then
     # ── Phase 2: wait for the prefill node to signal a restart ───────────────
-    echo ">>> USE_BENCH=1: waiting for Phase 2 restart signal from prefill node"
+    echo ">>> USE_BENCH/USE_GSM8K: waiting for Phase 2 restart signal from prefill node"
     echo "    (polling http://${PREFILL_IP}:${PHASE2_SIGNAL_PORT}/phase2 ...)"
     _sig_wait=0
     until curl -sf --max-time 5 "http://${PREFILL_IP}:${PHASE2_SIGNAL_PORT}/phase2" >/dev/null 2>&1; do
@@ -658,7 +712,7 @@ if [[ "${USE_BENCH}" == "1" ]]; then
     # The kv_transfer_config proxy_ip still points at PREFILL_IP where the toy proxy runs.
     start_decode "_phase2"
 
-    wait_for_health "moriio-decode (Phase 2)" "http://localhost:${DECODE_PORT}/health" 600
+    wait_for_health "moriio-decode (Phase 2)" "http://localhost:${DECODE_PORT}/health" 1800
 
     echo ""
     echo "=== Decode Phase 2 instance is healthy and registered with toy proxy ==="
