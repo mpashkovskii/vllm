@@ -13,7 +13,8 @@
 # The resulting image is used by run_pd_demo.sh.
 
 # ── base: same image used by the official ROCm vLLM image ────────────────────
-ARG BASE_IMAGE=docker.io/rocm/vllm-dev:base
+# Must be sha256-8404161df58334093533b2419b669e71d8cc4a4da2c74a2563bb833944fda8b4
+ARG BASE_IMAGE=rocm/vllm-dev:base
 FROM ${BASE_IMAGE} AS base
 
 # Basic utilities required for the build
