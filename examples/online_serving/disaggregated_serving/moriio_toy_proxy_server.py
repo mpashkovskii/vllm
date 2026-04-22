@@ -283,10 +283,12 @@ async def handle_request():
 
 
 if __name__ == "__main__":
-    t = start_service_discovery("0.0.0.0", 36367)
+    _ping_port = int(os.environ.get("PROXY_PING_PORT", "36367"))
+    _http_port = int(os.environ.get("PROXY_HTTP_PORT", "10001"))
+    t = start_service_discovery("0.0.0.0", _ping_port)
     app.debug = True
     app.config["BODY_TIMEOUT"] = 360000
     app.config["RESPONSE_TIMEOUT"] = 360000
 
-    app.run(host="0.0.0.0", port=10001)
+    app.run(host="0.0.0.0", port=_http_port)
     t.join()
