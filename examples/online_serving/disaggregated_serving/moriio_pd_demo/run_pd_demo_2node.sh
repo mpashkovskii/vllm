@@ -65,7 +65,9 @@ NOTIFY_PORT="${NOTIFY_PORT:-61005}"       # Prefill↔decode stage synchronisati
 # The prefill node starts a simple HTTP server on this port; the decode node polls it.
 PHASE2_SIGNAL_PORT="${PHASE2_SIGNAL_PORT:-19876}"
 
-VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev-0414-0859}"
+VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev}"
+#VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/simondanielsson/vllm-rocm-moriio:dev-hang-fixes}"
+
 # Basic router (smoke-test only — no streaming support)
 ROUTER_IMAGE="${ROUTER_IMAGE:-ghcr.io/simondanielsson/vllm-router:dev}"
 # Streaming-capable router (required for USE_BENCH=1 and USE_GSM8K=1)
@@ -453,6 +455,7 @@ docker run -d \
     "${_ACTIVE_ROUTER_IMAGE}" \
     vllm-router \
         --vllm-pd-disaggregation \
+        --kv-connector moriio \
         --vllm-discovery-address "0.0.0.0:${PROXY_PING_PORT}" \
         --port "${ROUTER_PORT}" \
         --host 0.0.0.0 \
