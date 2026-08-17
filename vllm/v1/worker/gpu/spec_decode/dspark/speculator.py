@@ -86,6 +86,11 @@ class DSparkSpeculator(DFlashSpeculator):
             self.speculative_config.enable_adaptive_verification
         )
 
+        # Online training: adapter built in load_model; capture stashes detached
+        # draft-step tensors for the runner to train on outside inference mode.
+        self._online: Any = None
+        self._online_capture: dict[str, torch.Tensor] | None = None
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
@@ -116,6 +121,115 @@ class DSparkSpeculator(DFlashSpeculator):
                 " a fixed number of drafts instead."
             )
         return model
+
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        if getattr(self.speculative_config, "dspark_online_training", None) is not None:
+            try:
+                from dspark_online import TrainingConfig, get_adapter
+            except ImportError as e:
+                raise ImportError(
+                    "DSpark online training requires the optional 'dspark-online' "
+                    "package. Install it with: pip install dspark-online"
+                ) from e
+
+            self._online = get_adapter()(
+                config=TrainingConfig.from_speculative_config(self.speculative_config),
+                model=self.model,
+                hidden_size=self.draft_model_config.get_hidden_size(),
+                device=self.device,
+            )
+
+    def online_should_commit_drafts(self) -> bool:
+        """Return whether committed drafting is currently enabled by training."""
+        return self._online is None or self._online.should_commit_drafts()
+
+    def online_train_after_step(
+        self,
+        last_sampled_tokens: torch.Tensor,
+        num_accepted: torch.Tensor | None,
+        num_sampled: torch.Tensor | None = None,
+        scheduled_drafts: torch.Tensor | None = None,
+    ) -> None:
+        """Run one budgeted online-training step outside inference mode.
+
+        The on-policy target for slot ``k`` is the token actually committed at
+        slot ``k + 1`` (teacher forcing on the target model's own continuation);
+        the final slot's target is ``last_sampled_tokens``.
+
+        Args:
+            last_sampled_tokens: The token the target model committed this step,
+                per request, shape ``[R]``.
+            num_accepted: Extra tokens accepted this step per request when
+                drafts were committed, else ``None``.
+            num_sampled: Tokens emitted per request this step (accepted drafts
+                plus one recovered/bonus token), shape ``[R]``. Supplied only
+                when drafts were committed; drives confidence-head labels.
+            scheduled_drafts: Drafts actually verified per request this step,
+                shape ``[R]``; defaults to ``num_speculative_steps``.
+        """
+        if self._online is None or self._online_capture is None:
+            return
+        capture = self._online_capture
+        prev = capture["prev"]
+        num_reqs, n_spec = prev.shape
+        targets = torch.empty_like(prev)
+        if n_spec > 1:
+            targets[:, : n_spec - 1] = prev[:, 1:]
+        targets[:, n_spec - 1] = last_sampled_tokens[:num_reqs]
+        if num_accepted is not None and self._online.should_commit_drafts():
+            self._online.observe_acceptance(float(num_accepted.float().mean()))
+        self._online.record_examples(
+            head_hidden_rows=capture["hidden"],
+            prev_tokens=prev,
+            target_tokens=targets,
+            valid_mask=capture["mask"],
+        )
+        if num_sampled is not None and "markov_embed" in capture:
+            self._record_confidence(
+                capture, num_sampled, scheduled_drafts, num_reqs, n_spec
+            )
+        self._online.maybe_train_step()
+        self._online_capture = None
+
+    def _record_confidence(
+        self,
+        capture: dict[str, torch.Tensor],
+        num_sampled: torch.Tensor,
+        scheduled_drafts: torch.Tensor | None,
+        num_reqs: int,
+        n_spec: int,
+    ) -> None:
+        """Build hard per-slot acceptance labels and buffer confidence rows.
+
+        The label for slot ``k`` is whether it was accepted (an unbiased
+        estimator of the ``1 - TV`` acceptance rate); only observed slots (up to
+        and including the first rejection) contribute.
+
+        Args:
+            capture: The stashed draft-step tensors (hidden, markov_embed).
+            num_sampled: Tokens emitted per request, shape ``[R]``.
+            scheduled_drafts: Drafts verified per request, shape ``[R]``, or
+                ``None`` for the fixed ``n_spec`` schedule.
+            num_reqs: Active request count ``R``.
+            n_spec: Speculative steps ``S``.
+        """
+        from dspark_online.confidence_labels import build_confidence_labels
+
+        ns = num_sampled[:num_reqs]
+        if scheduled_drafts is None:
+            scheduled = torch.full_like(ns, n_spec)
+        else:
+            scheduled = scheduled_drafts[:num_reqs]
+        labels, mask = build_confidence_labels(ns, n_spec, scheduled)
+        markov_embed = capture["markov_embed"]
+        head_hidden = capture["hidden"].view(num_reqs, n_spec, -1)
+        self._online.record_confidence_examples(
+            head_hidden_rows=head_hidden.reshape(num_reqs * n_spec, -1),
+            markov_embeds=markov_embed.reshape(num_reqs * n_spec, -1),
+            acceptance_targets=labels.reshape(num_reqs * n_spec),
+            valid_mask=mask.reshape(num_reqs * n_spec),
+        )
 
     def _sample_logits(
         self,
@@ -172,11 +286,20 @@ class DSparkSpeculator(DFlashSpeculator):
         # read via the precomputed persistent index (fixed buffer for capture).
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
+        capture_prev: list[torch.Tensor] | None = (
+            [] if self._online is not None else None
+        )
+        capture_conf = self._online is not None and self._online.trains_confidence()
+        capture_markov: list[torch.Tensor] | None = [] if capture_conf else None
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
+            if capture_prev is not None:
+                capture_prev.append(prev.detach().clone())
             markov_embed = self.model.markov_embed(prev)
             if self.enable_adaptive_verification:
                 confidence_markov_embeds.append(markov_embed)
+            if capture_markov is not None:
+                capture_markov.append(markov_embed.detach().clone())
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             draft_sampled_i = self._sample_logits(
@@ -193,6 +316,19 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
                 num_reqs, n_spec
             )
+
+        if capture_prev is not None:
+            self._online_capture = {
+                "hidden": sample_hidden.detach().clone(),
+                "prev": torch.stack(capture_prev, dim=1),
+                "mask": torch.ones(
+                    num_reqs, n_spec, dtype=torch.bool, device=self.device
+                ),
+            }
+            if capture_markov is not None:
+                self._online_capture["markov_embed"] = torch.stack(
+                    capture_markov, dim=1
+                )
 
     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         """Apply the sequential Markov head only to top-k base-logit candidates.

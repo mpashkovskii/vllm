@@ -82,6 +82,52 @@ DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
 @config
+class DSparkOnlineTrainingConfig:
+    """Online on-policy training of the DSpark speculator head while serving.
+
+    Presence of this config on ``SpeculativeConfig.dspark_online_training``
+    enables online training. The head starts loaded but not committing drafts;
+    it is promoted to committed speculation once its measured acceptance reaches
+    ``enable_acceptance_threshold`` extra tokens. DSpark method only, single-rank
+    only. Training is time-budgeted per decode step (see
+    ``training_time_budget_ms``); it reserves no GPU memory of its own, so lower
+    ``--gpu-memory-utilization`` to leave room for optimizer/gradient state.
+    """
+
+    training_time_budget_ms: float = Field(default=2.0, ge=0.0)
+    """Per-decode-step wall-clock budget (ms) reserved for a training step.
+    Training is skipped on steps predicted to exceed this budget so TTFT/TPOT
+    stay bounded."""
+
+    training_microbatch: int = Field(default=256, ge=1)
+    """Maximum number of (request, position) rows trained on per step."""
+
+    checkpoint_dir: str | None = None
+    """Directory to atomically dump DSpark head checkpoints into. When unset,
+    online training runs without persisting checkpoints."""
+
+    checkpoint_interval_steps: int = Field(default=500, ge=1)
+    """Trainer-step cadence between checkpoint dumps."""
+
+    enable_acceptance_threshold: float = Field(default=1.0, ge=0.0)
+    """Mean extra accepted tokens (measured during a canary window) required to
+    permanently enable committed DSpark speculation."""
+
+    canary_steps: int = Field(default=200, ge=1)
+    """Committed decode steps per canary window used to measure real acceptance
+    before enabling the head."""
+
+    readiness_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Top-1 agreement EMA (head prediction vs true next token) that triggers a
+    canary window from the disabled state."""
+
+    train_confidence_head: bool = False
+    """Also train the DSpark confidence head online (BCE against the analytical
+    1 - TV acceptance rate). Requires a checkpoint with a confidence head and
+    committed drafts (verified target logits); ignored otherwise."""
+
+
+@config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 
@@ -298,6 +344,11 @@ class SpeculativeConfig:
     dspark_draft_topk: int | None = Field(default=None, ge=1)
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
+
+    dspark_online_training: DSparkOnlineTrainingConfig | None = None
+    """Online on-policy training of the DSpark speculator head while serving.
+    Pass a JSON object (see ``DSparkOnlineTrainingConfig``) to enable it; leave
+    unset to disable. DSpark method only, single-rank only."""
 
     def compute_hash(self) -> str:
         """
@@ -1093,6 +1144,11 @@ class SpeculativeConfig:
 
                 if self.dspark_draft_topk is not None and self.method != "dspark":
                     raise ValueError("dspark_draft_topk is only supported by DSpark")
+
+                if self.dspark_online_training is not None and self.method != "dspark":
+                    raise ValueError(
+                        "dspark_online_training is only supported by DSpark"
+                    )
 
                 dspark_draft_topk = None
                 if self.method == "dspark":

@@ -71,6 +71,31 @@ class DSparkMarkovHead(nn.Module):
         """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
         return self.markov_w1(token_ids)
 
+    def enable_training(self) -> list[nn.Parameter]:
+        """Unfreeze the Markov projections for online on-policy training.
+
+        The head is replicated (``disable_tp=True``), so training is correct on
+        a single rank only; tensor-parallel world size > 1 is rejected.
+
+        Returns:
+            The list of trainable Markov parameters.
+
+        Raises:
+            RuntimeError: If the tensor-parallel world size is greater than one.
+        """
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            raise RuntimeError(
+                "DSpark online training is single-rank only; got tensor "
+                f"parallel size {tp_size}."
+            )
+        params = list(self.parameters())
+        for param in params:
+            param.requires_grad_(True)
+        return params
+
     def bias(
         self,
         markov_embed: torch.Tensor,

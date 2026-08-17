@@ -1802,11 +1802,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if self.adaptive_verification is not None:
-                self.adaptive_verification.record_confidences(
-                    self.speculator.draft_token_confidence_probs, input_batch
+            commit_drafts = True
+            if hasattr(self.speculator, "online_should_commit_drafts"):
+                commit_drafts = self.speculator.online_should_commit_drafts()
+                self.speculator.online_train_after_step(
+                    last_sampled_tokens=self.req_states.last_sampled_tokens[
+                        input_batch.idx_mapping
+                    ],
+                    num_accepted=(num_sampled - 1) if commit_drafts else None,
+                    num_sampled=num_sampled if commit_drafts else None,
                 )
+            if commit_drafts:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                if self.adaptive_verification is not None:
+                    self.adaptive_verification.record_confidences(
+                        self.speculator.draft_token_confidence_probs, input_batch
+                    )
+            else:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = 0
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
