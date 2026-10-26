@@ -98,13 +98,18 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.common.plan import (
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     BLOCKS,
+    DOWN_ROUNDS,
     G_TASKS,
     NA,
+    O_ROUNDS,
     P0,
+    P_ROUNDS,
     P_TASKS,
+    POOL_CTAS,
     R0,
     R_TASKS,
     RED_TASKS,
+    U_ROUNDS,
     K2Build,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.stages import (
@@ -199,13 +204,16 @@ def program(c, core: str = "tensor") -> None:
     # (not ``pre``: the seam's, assigned under a traced ``if`` below, must not
     # become that branch's state)
     core_pre = back.core_loads(c, core)
-    ops0 = back.o_loads(c, b)
-    ops1 = back.o_loads(c, b + BLOCKS)
+    # CTA b runs o_proj tasks b, b + BLOCKS, ... (O_ROUNDS of them: 2 at 256, 4
+    # at 128), every task's weights in flight before the first MFMA. NOTE: at
+    # O_ROUNDS > 2 this holds 4 tiles' loads live at once; the 128-wide build
+    # must be VGPR-checked (and pipelined to 2-deep if it spills) -- see #63712.
+    ops = [back.o_loads(c, b + r * BLOCKS) for r in range(O_ROUNDS)]
     if const_expr(core != "split"):
         settle(c)  # the context words' wait behind the core's and o_proj's loads
     back.load_core(c, core, core_pre)
-    back.stage_o(c, b, ops0)
-    back.stage_o(c, b + BLOCKS, ops1)
+    for r in range(O_ROUNDS):
+        back.stage_o(c, b + r * BLOCKS, ops[r])
     # -- phase 2: the seam (and routing), the router rows, the pooler
     if b < NA:
         pre = seam.seam_loads(c, b)
@@ -215,9 +223,16 @@ def program(c, core: str = "tensor") -> None:
     if (b >= R0) & (b < R0 + R_TASKS):
         rops = router.router_loads(c, b - R0)
         router.stage_router(c, b - R0, rops)
-    if (b >= P0) & (b < P0 + P_TASKS):
-        pops = pool.pool_loads(c, b - P0)
-        pool.stage_pool(c, b - P0, pops)
+    # the pooler owns the grid tail [P0, BLOCKS): CTA b takes tasks b - P0,
+    # + POOL_CTAS, ... (P_ROUNDS of them, striding by the tail width). One round
+    # at 256 (b - P0 < P_TASKS reproduces the old [P0, P0 + P_TASKS) range), four
+    # at 128 where the tail is only POOL_CTAS = 32 wide.
+    if b >= P0:
+        for r in range(P_ROUNDS):
+            t = b - P0 + r * POOL_CTAS
+            if t < P_TASKS:
+                pops = pool.pool_loads(c, t)
+                pool.stage_pool(c, t, pops)
     # -- phase 3: the a1 rows and ug (every CTA that can get a ug task:
     # spec.ug_cta0; nothing else reads xq), the union, down (every CTA)
     ug0 = spec.ug_cta0(s)
@@ -232,14 +247,23 @@ def program(c, core: str = "tensor") -> None:
             experts.run_ug(c, nu)
     else:
         experts.run_ug(c, nu)
-    experts.run_down(c, b32, nu)
+    # CTA b owns down row groups b, b + BLOCKS, ... (DOWN_ROUNDS: 1 at 256, 2 at
+    # 128). NOTE: each run_down re-issues load_inter; it polls already-current
+    # INTER pairs, so a second round is correct but redundant -- fold load_inter
+    # out of the round loop once the 128 build is validated (#63712).
+    for r in range(DOWN_ROUNDS):
+        experts.run_down(c, b32 + r * BLOCKS, nu)
     # -- phase 4: owner reduce, unpooler (weights before the reduce's waits),
     # gather
-    uops = unpool.unpool_loads(c, b)
-    j = b32 - RED_TASKS * c["rank"]
+    uops = [unpool.unpool_loads(c, b + r * BLOCKS) for r in range(U_ROUNDS)]
+    # owner slice j of this rank runs on CTA (RED_TASKS * rank) mod BLOCKS + j:
+    # the 8 ranks' 32-CTA bands fit [0, 256) at 256 (the mask is a no-op); at 128
+    # the bands wrap into [0, 128), which is fine -- each rank is its own launch.
+    j = b32 - (RED_TASKS * c["rank"] & fx.Int32(BLOCKS - 1))
     if (j >= 0) & (j < RED_TASKS):
         reduce.stage_owner(c, j)
-    unpool.stage_unpool(c, b, uops)
+    for r in range(U_ROUNDS):
+        unpool.stage_unpool(c, b + r * BLOCKS, uops[r])
     if b < G_TASKS:
         unpool.stage_gather(c, b)
 

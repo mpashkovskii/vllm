@@ -84,7 +84,15 @@ MAX_U = MAX_PICKS  # experts in a step's union
 # --------------------------------------------------------------------------
 # Grid: one CTA per CU, all resident
 
+# The grid is one co-resident CTA per CU, so its width is the part's CU count.
+# MI355X has 256, MI350P 128; both are gfx950, so the per-CTA budget (LDS, VGPR,
+# occupancy) is identical and only the CTA count -- and thus the per-CTA task
+# fan-out -- differs. Every task count below is fixed by the model shape, not by
+# BLOCKS; a narrower grid runs more rounds per CTA (``*_ROUNDS``), never fewer
+# tasks. SUPPORTED_WIDTHS is the set the static placement is validated for.
+SUPPORTED_WIDTHS = (256, 128)
 BLOCKS = 256
+assert BLOCKS in SUPPORTED_WIDTHS
 THREADS = 512
 WAVES = THREADS // 64  # 8
 LDS_BYTES = 160 * 1024  # a CU's LDS: one CTA's whole
@@ -92,10 +100,22 @@ VGPR_MAX = 256  # arch + acc VGPRs a lane at 2 waves a SIMD
 ROWS = 16  # output rows of a GEMV task (one MFMA tile)
 COLS = 128  # columns of a seam / gather CTA
 
+
+def cdiv(a: int, b: int) -> int:
+    """ceil(a / b) for a >= 0, b > 0."""
+    return (a + b - 1) // b
+
+
+def rounds(tasks: int, blocks: int = BLOCKS) -> int:
+    """CTA b runs tasks b, b + blocks, ... b + (rounds - 1) * blocks: the number
+    of grid-striped passes a stage of ``tasks`` tasks takes on a ``blocks``-wide
+    grid. One per CTA when tasks <= blocks."""
+    return cdiv(tasks, blocks)
+
 # --------------------------------------------------------------------------
 # K2 placement (static; section 5.2 of the design)
 
-O_TASKS = HIDDEN // ROWS  # 512 o_proj tasks: CTA b runs b and b + BLOCKS
+O_TASKS = HIDDEN // ROWS  # 512 o_proj tasks: CTA b runs b, b + BLOCKS, ...
 NA = HIDDEN // COLS  # 64 seam CTAs [0, NA): 128 columns each
 R0 = 64  # router CTAs [R0, R0 + R_TASKS): one expert row each
 R_TASKS = EXPERTS_RANK  # 32
@@ -108,7 +128,7 @@ UG_GROUPS = INTER // 32  # 16 ug tasks a union slot (32 columns each)
 W13_K = MOE_HIDDEN  # 4096
 W13_STEPS = W13_K // 128  # 32 (16 a K half)
 W2_STEPS = INTER // 128  # 4
-DOWN_TASKS = MOE_HIDDEN // ROWS  # 256 == BLOCKS: CTA b owns rows 16b .. 16b + 16
+DOWN_TASKS = MOE_HIDDEN // ROWS  # 256: CTA b owns down rows 16b .. 16b + 16, ...
 DOWN_BATCH = 4  # slots of w2 in flight a wave
 OWN_COLS = MOE_HIDDEN // TP  # 512 pooled columns a rank owns (reduce-scatter)
 RED_TASKS = OWN_COLS // ROWS  # 32 owner CTAs [32 rank, 32 rank + 32)
@@ -117,6 +137,18 @@ U_PARTS = 4  # K quarters of an unpooler row group
 U_K = MOE_HIDDEN // U_PARTS  # 1024
 U_TASKS = U_GROUPS * U_PARTS  # 256: CTA b: g = b // U_PARTS, q = b % U_PARTS
 G_TASKS = HIDDEN // COLS  # 64 gather CTAs [0, G_TASKS)
+
+# Per-CTA task fan-out of the grid-striped K2 stages (CTA b runs b, b + BLOCKS,
+# ...). At BLOCKS = 256 every round count is today's value (o_proj 2, down /
+# unpool 1); at BLOCKS = 128 a CTA runs twice the rounds. The phase-2 roles
+# (seam / router / pooler) keep their fixed CTA ranges [0, NA), [R0, R0 +
+# R_TASKS) and [P0, ...); only the pooler, which owns the grid tail [P0, BLOCKS),
+# stripes its P_TASKS over the POOL_CTAS it has (one round when they fit).
+O_ROUNDS = rounds(O_TASKS)  # 2 (256) / 4 (128)
+DOWN_ROUNDS = rounds(DOWN_TASKS)  # 1 (256) / 2 (128)
+U_ROUNDS = rounds(U_TASKS)  # 1 (256) / 2 (128)
+POOL_CTAS = BLOCKS - P0  # pooler CTAs: 160 (256) / 32 (128)
+P_ROUNDS = rounds(P_TASKS, POOL_CTAS)  # 1 (256) / 4 (128)
 
 
 def ug_cta0(s: int) -> int:
@@ -173,6 +205,26 @@ assert K1_TASKS == K1_TPC * K1_GEMV_CTAS and ROWS * QKV_TILES == QKV_ROWS
 assert ROW_G + CORE == QKV_ROWS and KPART * KPARTS == HIDDEN and KPART == 4 * COLS
 assert E_UNITS * MAX_ROWS <= NA and K1_ROUNDS * 2 == K1_TPC
 
+
+def _validate_k1_placement(blocks: int) -> None:
+    """The K1 qkv GEMV placement fits a ``blocks``-wide grid: the GEMV CTAs
+    [K1_GEMV0, blocks) tile the (tile, K part) tasks exactly, each CTA's task
+    count is even (two waves take 2 r / 2 r + 1 a round), and no qkv tile is
+    split across more than K1_MAXC GEMV CTAs (``qpart`` holds K1_MAXC partials a
+    tile). The boundary / epilogue CTAs [0, NA) are width-independent."""
+    gemv_ctas = blocks - K1_GEMV0
+    assert gemv_ctas > 0 and K1_TASKS % gemv_ctas == 0, blocks
+    tpc = K1_TASKS // gemv_ctas
+    assert tpc % 2 == 0, (blocks, tpc)
+    for t in range(QKV_TILES):  # a tile's KPARTS tau values span <= K1_MAXC CTAs
+        first = (KPARTS * t) // tpc
+        last = (KPARTS * t + KPARTS - 1) // tpc
+        assert last - first + 1 <= K1_MAXC, (blocks, t)
+
+
+for _w in SUPPORTED_WIDTHS:
+    _validate_k1_placement(_w)
+
 # --------------------------------------------------------------------------
 # K2 split-KV core placement (Phase C, q = 1 widths; DESIGN_BC 7.1). Split
 # unit u = (t * 2 + kvh) * N + p runs on CTA u; combine (t, h) on CTA
@@ -182,14 +234,19 @@ NSPLIT_SW = 9  # sliding: <= 129 pages a window -> <= 9 live units
 MIN_PER = 16  # pages a live unit at least: two a wave (two in flight)
 
 
-def nsplit(S: int, window: bool) -> int:
-    """N: units a (token, KV head) (DESIGN_BC 7.1)."""
-    return NSPLIT_SW if window else BLOCKS // (2 * S)
+def nsplit(S: int, window: bool, blocks: int = BLOCKS) -> int:
+    """N: units a (token, KV head) (DESIGN_BC 7.1). Capped so the launch's
+    2 * S * N units fit a ``blocks``-wide grid: ``split.pages`` sizes a unit at
+    ``max(cdiv(nb, N), MIN_PER)`` pages, so a smaller N just gives larger (still
+    correct) units -- the window's NSPLIT_SW is an upper bound, not a floor.
+    At 256 every S keeps today's N (blocks // (2 S) >= NSPLIT_SW for a window)."""
+    full = blocks // (2 * S)
+    return min(NSPLIT_SW, full) if window else full
 
 
-def n_units(S: int, window: bool) -> int:
+def n_units(S: int, window: bool, blocks: int = BLOCKS) -> int:
     """Split units of a launch (CTAs [0, n_units))."""
-    return 2 * S * nsplit(S, window)
+    return 2 * S * nsplit(S, window, blocks)
 
 
 def n_comb(S: int) -> int:
@@ -197,16 +254,26 @@ def n_comb(S: int) -> int:
     return HEADS * S
 
 
-def C0(S: int) -> int:
-    """The first combine CTA: [C0, BLOCKS) runs one (token, q head) each."""
-    return BLOCKS - n_comb(S)
+def C0(S: int, blocks: int = BLOCKS) -> int:
+    """The first combine CTA: [C0, blocks) runs one (token, q head) each."""
+    return blocks - n_comb(S)
 
 
-assert all(
-    n_units(s, w) <= BLOCKS and C0(s) >= BLOCKS // 2
-    for s in range(1, MAX_ROWS + 1)
-    for w in (False, True)
-)
+def _validate_split_placement(blocks: int) -> None:
+    """The split-KV core placement fits a ``blocks``-wide grid at every width S:
+    the split units [0, n_units) and the combine CTAs [C0, blocks) both fit, and
+    a unit has at least one page part. The two ranges may overlap (they already
+    do at 256, S = 8); a CTA holding both runs its unit first, so overlap needs
+    no separation -- only C0 >= 0 (n_comb <= blocks)."""
+    for s in range(1, MAX_ROWS + 1):
+        assert n_comb(s) <= blocks, (blocks, s)  # C0 >= 0
+        for w in (False, True):
+            assert nsplit(s, w, blocks) >= 1, (blocks, s, w)
+            assert n_units(s, w, blocks) <= blocks, (blocks, s, w)
+
+
+for _w in SUPPORTED_WIDTHS:
+    _validate_split_placement(_w)
 
 # --------------------------------------------------------------------------
 # Mailbox tags: tag = (epoch & EPOCH_MASK) * TAG_SLOTS + slot + 1
@@ -239,10 +306,29 @@ def step_tag(epoch: int, slot: int) -> int:
     return (epoch & EPOCH_MASK) * TAG_SLOTS + slot + 1
 
 
-assert P0 + P_TASKS <= BLOCKS and R0 + R_TASKS <= P0 and NA <= R0
-assert DOWN_TASKS == BLOCKS and U_TASKS == BLOCKS and O_TASKS == 2 * BLOCKS
+def _validate_k2_placement(blocks: int) -> None:
+    """The static K2 MoE / o_proj placement holds on a ``blocks``-wide grid: the
+    phase-2 roles pack into disjoint CTA ranges and every grid-striped stage
+    tiles its model-fixed task count exactly. Run for every SUPPORTED_WIDTHS at
+    import, so a narrower grid (MI350P's 128) is proven before any kernel builds.
+    The split-KV core and K1 GEMV placement are validated separately (they need
+    their own width rework; windowed split overflows a 128-wide grid)."""
+    pool_ctas = blocks - P0
+    # phase-2 roles seam [0, NA), router [R0, R0 + R_TASKS), pooler [P0, blocks)
+    # are disjoint and within the grid
+    assert NA <= R0 and R0 + R_TASKS <= P0 and blocks > P0, blocks
+    assert blocks >= G_TASKS and pool_ctas > 0, blocks
+    # grid-striped stages (CTA b: b, b + blocks, ...) tile their tasks exactly
+    assert O_TASKS % blocks == 0 and DOWN_TASKS % blocks == 0, blocks
+    assert U_TASKS % blocks == 0, blocks
+    # the pooler tail covers its P_TASKS over the CTAs it has
+    assert cdiv(P_TASKS, pool_ctas) * pool_ctas >= P_TASKS, blocks
+
+
+for _w in SUPPORTED_WIDTHS:
+    _validate_k2_placement(_w)
 assert RED_TASKS * TP == DOWN_TASKS and MAX_ROWS <= MAX_TOKENS <= 8
-assert G_TASKS <= BLOCKS and MAX_U <= EXPERTS and TOPK <= 8
+assert MAX_U <= EXPERTS and TOPK <= 8
 assert step_tag(EPOCH_MASK, TAG_SLOTS - 1) < 2**31  # a tag is a positive int32
 
 # --------------------------------------------------------------------------
