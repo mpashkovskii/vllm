@@ -21,9 +21,11 @@ model packages and register themselves on import.
 import os
 from dataclasses import dataclass
 
-# The activation x weight MXFP quant a model's routed experts run. Only the
-# first is implemented today; ``stages.moe`` raises for the others at build.
-QUANTS = ("mxfp4_mxfp8", "mxfp4_mxfp4")
+# The activation x weight quant a model's routed experts run. DeepSeek-V4.1's
+# ``stages.moe`` implements ``mxfp4_mxfp8`` today; the others name a build each
+# of the merged mono MoE models (K3 / MuseSpark inline MXFP4, MiniMax A16W4) so
+# a config can describe them before the shared stage body gains their path.
+QUANTS = ("mxfp4_mxfp8", "mxfp4_mxfp4", "a16w4")
 
 MODEL_ENV = "VLLM_MONO_K2_MODEL"
 ARCH_ENV = "VLLM_MONO_K2_ARCH"
@@ -89,6 +91,14 @@ class MoeMonoConfig:
     quant: str  # one of QUANTS
     parallel: ParallelConfig
     supports: tuple[tuple[str, int], ...] = _CU256
+    # the width the experts actually see: a latent/pooled MoE (K3, MuseSpark)
+    # compresses the stream first, so this is below ``hidden``; 0 => == hidden
+    # (DeepSeek-V4.1, MiniMax: the experts read the stream directly).
+    moe_hidden: int = 0
+
+    def __post_init__(self):
+        if self.moe_hidden == 0:
+            object.__setattr__(self, "moe_hidden", self.hidden)
 
 
 def gate(cfg: MoeMonoConfig) -> list[str]:
@@ -169,19 +179,24 @@ def active_arch() -> ArchConfig:
     return arch_named(os.environ.get(ARCH_ENV, "MI355X"))
 
 
+def named(name: str) -> MoeMonoConfig:
+    """A registered model by name. A model's own stages bind to it directly
+    (``named("kimi_k3")``), rather than ``active()``, so every model's shape is
+    its own even when several are registered in one process (the CPU tests)."""
+    try:
+        return _REGISTRY[name]
+    except KeyError:
+        raise ValueError(
+            f"no such K2 MoE model {name!r} (have {sorted(_REGISTRY)})"
+        ) from None
+
+
 def active() -> MoeMonoConfig:
     """The model this process serves: ``VLLM_MONO_K2_MODEL`` (default the sole
     registered DeepSeek-V4.1 shape). Read at module import by the stages, as the
     grid width is: the runner sets it before the device modules load."""
     name = os.environ.get(MODEL_ENV)
-    if name is None:
-        return DSV41
-    try:
-        return _REGISTRY[name]
-    except KeyError:
-        raise ValueError(
-            f"{MODEL_ENV}={name!r}: no such K2 MoE model (have {sorted(_REGISTRY)})"
-        ) from None
+    return DSV41 if name is None else named(name)
 
 
 # -------------------------------------------------------------- registered archs
@@ -212,5 +227,46 @@ DSV41 = register(
         quant="mxfp4_mxfp8",
         parallel=ParallelConfig(tp=4),
         supports=_CU256,
+    )
+)
+
+# Kimi-K3 (merged mono MoE, pr60683 + pr61435). A latent MoE: the experts read
+# the LAT=3584 compressed stream, not HIDDEN=7168. 896 routed experts, top-16, a
+# shared expert; inline MXFP4 x MXFP4. TP8, gfx950 and gfx942. Full intermediates
+# are the per-rank RI=384 / SI=768 times TP. (Its stages live in the kimi_k3
+# package; this entry moves there on the shared-package relocation.)
+KIMI_K3 = register(
+    MoeMonoConfig(
+        name="kimi_k3",
+        hidden=7168,
+        moe_hidden=3584,
+        moe_inter=384 * 8,
+        shared_inter=768 * 8,
+        experts=896,
+        topk=16,
+        moe_pad=128,
+        quant="mxfp4_mxfp4",
+        parallel=ParallelConfig(tp=8),
+        supports=_CU256,
+    )
+)
+
+# MiniMax-M3 (merged mono MoE). 128 routed experts, top-4, a fused shared expert
+# (union slot 0); A16W4 (int4 weight, bf16 activation). The experts read the
+# stream directly (no latent compression). TP4, gfx950 (256-CU) only. Full
+# intermediates are the per-rank INTER=768 times TP; the shared expert shares the
+# routed width.
+MINIMAX_M3 = register(
+    MoeMonoConfig(
+        name="minimax_m3",
+        hidden=6144,
+        moe_inter=768 * 4,
+        shared_inter=768 * 4,
+        experts=128,
+        topk=4,
+        moe_pad=128,
+        quant="a16w4",
+        parallel=ParallelConfig(tp=4),
+        supports=(("gfx950", 256),),
     )
 )
