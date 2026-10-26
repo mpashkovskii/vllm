@@ -205,6 +205,26 @@ assert K1_TASKS == K1_TPC * K1_GEMV_CTAS and ROWS * QKV_TILES == QKV_ROWS
 assert ROW_G + CORE == QKV_ROWS and KPART * KPARTS == HIDDEN and KPART == 4 * COLS
 assert E_UNITS * MAX_ROWS <= NA and K1_ROUNDS * 2 == K1_TPC
 
+
+def _validate_k1_placement(blocks: int) -> None:
+    """The K1 qkv GEMV placement fits a ``blocks``-wide grid: the GEMV CTAs
+    [K1_GEMV0, blocks) tile the (tile, K part) tasks exactly, each CTA's task
+    count is even (two waves take 2 r / 2 r + 1 a round), and no qkv tile is
+    split across more than K1_MAXC GEMV CTAs (``qpart`` holds K1_MAXC partials a
+    tile). The boundary / epilogue CTAs [0, NA) are width-independent."""
+    gemv_ctas = blocks - K1_GEMV0
+    assert gemv_ctas > 0 and K1_TASKS % gemv_ctas == 0, blocks
+    tpc = K1_TASKS // gemv_ctas
+    assert tpc % 2 == 0, (blocks, tpc)
+    for t in range(QKV_TILES):  # a tile's KPARTS tau values span <= K1_MAXC CTAs
+        first = (KPARTS * t) // tpc
+        last = (KPARTS * t + KPARTS - 1) // tpc
+        assert last - first + 1 <= K1_MAXC, (blocks, t)
+
+
+for _w in SUPPORTED_WIDTHS:
+    _validate_k1_placement(_w)
+
 # --------------------------------------------------------------------------
 # K2 split-KV core placement (Phase C, q = 1 widths; DESIGN_BC 7.1). Split
 # unit u = (t * 2 + kvh) * N + p runs on CTA u; combine (t, h) on CTA
@@ -214,14 +234,19 @@ NSPLIT_SW = 9  # sliding: <= 129 pages a window -> <= 9 live units
 MIN_PER = 16  # pages a live unit at least: two a wave (two in flight)
 
 
-def nsplit(S: int, window: bool) -> int:
-    """N: units a (token, KV head) (DESIGN_BC 7.1)."""
-    return NSPLIT_SW if window else BLOCKS // (2 * S)
+def nsplit(S: int, window: bool, blocks: int = BLOCKS) -> int:
+    """N: units a (token, KV head) (DESIGN_BC 7.1). Capped so the launch's
+    2 * S * N units fit a ``blocks``-wide grid: ``split.pages`` sizes a unit at
+    ``max(cdiv(nb, N), MIN_PER)`` pages, so a smaller N just gives larger (still
+    correct) units -- the window's NSPLIT_SW is an upper bound, not a floor.
+    At 256 every S keeps today's N (blocks // (2 S) >= NSPLIT_SW for a window)."""
+    full = blocks // (2 * S)
+    return min(NSPLIT_SW, full) if window else full
 
 
-def n_units(S: int, window: bool) -> int:
+def n_units(S: int, window: bool, blocks: int = BLOCKS) -> int:
     """Split units of a launch (CTAs [0, n_units))."""
-    return 2 * S * nsplit(S, window)
+    return 2 * S * nsplit(S, window, blocks)
 
 
 def n_comb(S: int) -> int:
@@ -229,16 +254,26 @@ def n_comb(S: int) -> int:
     return HEADS * S
 
 
-def C0(S: int) -> int:
-    """The first combine CTA: [C0, BLOCKS) runs one (token, q head) each."""
-    return BLOCKS - n_comb(S)
+def C0(S: int, blocks: int = BLOCKS) -> int:
+    """The first combine CTA: [C0, blocks) runs one (token, q head) each."""
+    return blocks - n_comb(S)
 
 
-assert all(
-    n_units(s, w) <= BLOCKS and C0(s) >= BLOCKS // 2
-    for s in range(1, MAX_ROWS + 1)
-    for w in (False, True)
-)
+def _validate_split_placement(blocks: int) -> None:
+    """The split-KV core placement fits a ``blocks``-wide grid at every width S:
+    the split units [0, n_units) and the combine CTAs [C0, blocks) both fit, and
+    a unit has at least one page part. The two ranges may overlap (they already
+    do at 256, S = 8); a CTA holding both runs its unit first, so overlap needs
+    no separation -- only C0 >= 0 (n_comb <= blocks)."""
+    for s in range(1, MAX_ROWS + 1):
+        assert n_comb(s) <= blocks, (blocks, s)  # C0 >= 0
+        for w in (False, True):
+            assert nsplit(s, w, blocks) >= 1, (blocks, s, w)
+            assert n_units(s, w, blocks) <= blocks, (blocks, s, w)
+
+
+for _w in SUPPORTED_WIDTHS:
+    _validate_split_placement(_w)
 
 # --------------------------------------------------------------------------
 # Mailbox tags: tag = (epoch & EPOCH_MASK) * TAG_SLOTS + slot + 1
