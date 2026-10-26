@@ -45,6 +45,7 @@ from vllm.models.deepseek_v41.amd.mono.common.ops import (
     sum_partials,
     traced,
 )
+from vllm.models.deepseek_v41.amd.mono.common.config import active
 from vllm.models.deepseek_v41.amd.mono.common.plan import THREADS, WAVES, pair_layout
 from vllm.models.deepseek_v41.amd.mono.common.sync import preg
 from vllm.models.deepseek_v41.amd.mono.stages.gemv import (
@@ -55,7 +56,7 @@ from vllm.models.deepseek_v41.amd.mono.stages.gemv import (
 )
 
 HC = 4
-HIDDEN = 5120
+HIDDEN = active().hidden  # the residual stream width (the active K2 MoE config's)
 K_MIX = HC * HIDDEN
 MIX = HC * (HC + 2)  # 24 projections: pre 4 | post 4 | comb 16
 EPS = 1e-20

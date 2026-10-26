@@ -8,14 +8,16 @@ from the TP size, in one place (a build key's ``tp`` picks it)."""
 
 from dataclasses import dataclass
 
+from vllm.models.deepseek_v41.amd.mono.common.config import active
 from vllm.models.deepseek_v41.amd.mono.common.plan import Shard, padded
 
-# the model's full widths
-MOE_INTER = 2304  # a routed expert's intermediate width
-SHARED_INTER = 2304  # the shared expert's
+# the model's full widths (from the active K2 MoE config: one per process)
+_CFG = active()
+MOE_INTER = _CFG.moe_inter  # a routed expert's intermediate width
+SHARED_INTER = _CFG.shared_inter  # the shared expert's (0 => no shared expert)
 # the loader pads a routed expert's rank share to a multiple of this (``FusedMoE``
 # ``pad_align``) with zero weights
-MOE_PAD = 128
+MOE_PAD = _CFG.moe_pad
 ROWS = 16  # GEMV rows a task
 UG_PART = 32  # intermediate columns an ug task part: one FP4 group
 

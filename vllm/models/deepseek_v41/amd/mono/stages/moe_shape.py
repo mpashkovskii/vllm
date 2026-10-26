@@ -12,13 +12,16 @@ from dataclasses import dataclass, field
 
 import flydsl.expr as fx
 
+from vllm.models.deepseek_v41.amd.mono.common.config import active
 from vllm.models.deepseek_v41.amd.mono.common.plan import BLOCKS, WAVES
 from vllm.models.deepseek_v41.amd.mono.stages import moe_plan as mplan
 from vllm.models.deepseek_v41.amd.mono.stages.dims import UG_PART, Dims
 from vllm.models.deepseek_v41.amd.mono.stages.gemv import ROWS, TILE, token_tiles
 from vllm.models.deepseek_v41.amd.mono.stages.router import PARTS as ROUTER_PARTS
 
-EXPERTS, TOPK = 384, 6  # the target's routing (a build's: ``MoeBuild``)
+_CFG = active()
+# the target's routing (a build's own: ``MoeBuild``)
+EXPERTS, TOPK = _CFG.experts, _CFG.topk
 ROUTER0 = 8  # the router's first task: past the xq tasks (a token each)
 MASK_WORDS = 2  # an expert's token bitmap in the route table: tokens <= 64
 # a route lane's experts (EXPERTS / 64) sorted descending, ties kept in index
@@ -49,10 +52,19 @@ class MoeBuild:
     experts: int = EXPERTS
     topk: int = TOPK
     # the TP size: every width a rank holds (``Dims``)
-    tp: int = 4
+    tp: int = _CFG.parallel.tp
     timeline: bool = field(default=False, metadata={"sym": "tl"})
     # FP4 groups an ug task (``RouteShape.ug_groups``)
     ug_groups: int = 2
+    # the active model's shape (the stages read these from ``config.active`` as
+    # per-process constants; carried here too so the FlyDSL JIT cache key is
+    # self-describing and two models never share a binary). Not a placement
+    # input -- ``RouteShape``/``Dims`` derive placement from experts/topk/tp.
+    hidden: int = _CFG.hidden
+    moe_inter: int = _CFG.moe_inter
+    shared_inter: int = _CFG.shared_inter
+    moe_pad: int = _CFG.moe_pad
+    quant: str = _CFG.quant
 
 
 @dataclass(frozen=True)

@@ -246,11 +246,31 @@ def _unsupported_moe(layer: "DeepseekV4DecoderLayer", vllm_config) -> str | None
     """Why the kernels cannot run this deployment's MoE, or None. They read every
     one of the 384 experts on each rank, TP-sharded, in AITER's A8W4 MXFP4
     layout."""
+    from dataclasses import replace
+
     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+    from vllm.models.deepseek_v41.amd.mono.common import config as k2cfg
 
     pc = vllm_config.parallel_config
-    if pc.enable_expert_parallel or pc.enable_eplb or pc.data_parallel_size > 1:
-        return "needs tensor parallelism only: no expert or data parallelism"
+    # The unified K2 MoE config gate is the single parallelism policy: it refuses
+    # pipeline, data, expert, decode-context and sequence parallelism (the kernel
+    # is intra-layer and TP-only). EPLB has no gate axis and is refused below.
+    reasons = k2cfg.gate(
+        replace(
+            k2cfg.active(),
+            parallel=k2cfg.ParallelConfig(
+                tp=pc.tensor_parallel_size,
+                pp=pc.pipeline_parallel_size,
+                dp=pc.data_parallel_size,
+                ep=2 if pc.enable_expert_parallel else 1,
+                dcp=pc.decode_context_parallel_size,
+            ),
+        )
+    )
+    if reasons:
+        return reasons[0]
+    if pc.enable_eplb:
+        return "needs tensor parallelism only: no EPLB"
     if envs.VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4:
         return "needs AITER's A8W4 MoE (VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4 unset)"
     experts = getattr(getattr(layer.ffn, "experts", None), "routed_experts", None)

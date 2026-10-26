@@ -20,10 +20,11 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
+from vllm.models.deepseek_v41.amd.mono.common.config import active
 from vllm.models.deepseek_v41.amd.mono.common.ops import mfma_bf16, rsrc
 from vllm.models.deepseek_v41.amd.mono.common.plan import WAVES
 
-HIDDEN = 5120
+HIDDEN = active().hidden  # the residual stream width (the active K2 MoE config's)
 ROWS = 16  # a tile's rows: the MFMA's M
 PARTS = 4  # contiguous K parts of a tile, summed in order
 
