@@ -146,6 +146,29 @@ def test_gate_refuses_unknown_quant():
     assert any("quant" in r for r in C.gate(cfg))
 
 
+def test_mi350p_arch_registered():
+    mi350p = C.arch_named("MI350P")
+    assert (mi350p.gfx, mi350p.cus, mi350p.fnuz) == ("gfx950", 128, False)
+    assert mi350p.lds_bytes == 160 * 1024
+    # the gfx950 256-CU parts and the gfx942 family are registered too
+    for name in ("MI355X", "MI350X", "MI300X", "MI325X"):
+        assert C.arch_named(name).cus == 256
+    assert C.arch_named("MI300X").fnuz is True
+
+
+def test_default_active_arch_is_mi355x():
+    assert C.active_arch().name == "MI355X"
+
+
+def test_arch_gate_refuses_mi350p_for_dsv41():
+    # DeepSeek-V4.1 is validated on the 256-CU grid only; MI350P's 128-CU grid
+    # has no tiling yet, so the arch gate refuses it.
+    reasons = C.arch_gate(C.DSV41, C.arch_named("MI350P"))
+    assert reasons and "MI350P" in reasons[0]
+    for name in ("MI355X", "MI350X", "MI300X", "MI325X"):
+        assert C.arch_gate(C.DSV41, C.arch_named(name)) == []
+
+
 def test_no_shared_expert_collapses_placement():
     # A model with no shared expert (shared_inter == 0) has no shared units, so
     # the ug stage starts where the shared placement would have ended.
