@@ -111,7 +111,7 @@ _LAY = scratch_layout()
 PSTAT_BYTES = _LAY[PSTAT][1]  # the masked loads' buffer sizes: an index
 OPART_BYTES = _LAY[OPART][1]  # past live reads zeros, no memory access
 assert HEAD_DIM == 64 and Q_PER_KV == WAVES  # lane = dim; the LDS sum by wave
-assert HEADS == 2 * Q_PER_KV  # h = 8 kvh + j
+assert HEADS % Q_PER_KV == 0  # h = Q_PER_KV * kvh + j (KV_HEADS kv heads)
 
 
 @functools.cache

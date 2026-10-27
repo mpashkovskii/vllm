@@ -74,6 +74,7 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     HEAD_DIM,
     KV_BLOCK,
     KV_HEADS,
+    Q_GROUPS,
     QKV_ROWS,
     RMS_EPS,
     ROW_G,
@@ -90,7 +91,7 @@ INV_D = 2.0**-6  # 1 / HEAD_DIM: the .cu's ``sumsq / 64`` is fma(tot, 2^-6, eps)
 ROPE_COLS = HEAD_DIM  # a cos_sin_cache row: cos in 0 .. 31, sin in 32 .. 63
 KV_WAVES = 2 * KV_HEADS  # g5 2: the k heads, then the v heads
 assert HEAD_DIM == 64 and ROW_K + KV_HEADS * HEAD_DIM == ROW_V and V_OFF == HEAD_DIM
-assert 2 * WAVES * HEAD_DIM == ROW_K and 2 * WAVES * HEAD_DIM == QKV_ROWS - ROW_G
+assert Q_GROUPS * WAVES * HEAD_DIM == ROW_K and ROW_K == QKV_ROWS - ROW_G
 
 
 def unit_row(g5, w):
@@ -99,13 +100,13 @@ def unit_row(g5, w):
     (inserted): (row0, live, qk, kv). Python ints or wave-uniform
     traced Int32 alike."""
     rq = ROW_Q + HEAD_DIM * (WAVES * g5 + w)
-    rk = ROW_K + HEAD_DIM * w  # k heads 0, 1 then v heads 0, 1: contiguous
-    rg = ROW_G + HEAD_DIM * (WAVES * (g5 - 3) + w)
-    row0 = sel(g5 < 2, rq, sel(g5 == 2, rk, rg))
-    is_kv = g5 == 2
+    rk = ROW_K + HEAD_DIM * w  # k heads then v heads: contiguous
+    rg = ROW_G + HEAD_DIM * (WAVES * (g5 - Q_GROUPS - 1) + w)
+    row0 = sel(g5 < Q_GROUPS, rq, sel(g5 == Q_GROUPS, rk, rg))
+    is_kv = g5 == Q_GROUPS
     kv = is_kv & (w < KV_WAVES)
-    live = (g5 != 2) | (w < KV_WAVES)
-    qk = (g5 < 2) | (is_kv & (w < KV_HEADS))
+    live = (g5 != Q_GROUPS) | (w < KV_WAVES)
+    qk = (g5 < Q_GROUPS) | (is_kv & (w < KV_HEADS))
     return row0, live, qk, kv
 
 

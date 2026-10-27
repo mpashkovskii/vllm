@@ -53,6 +53,7 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     CORE,
     HEAD_DIM,
     HEADS,
+    Q_GROUPS,
     QKV_ROWS,
     RMS_EPS,
     ROW_G,
@@ -61,17 +62,18 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.stages import gemv
 
 XL_ROW = CORE + gemv.LDS_PAD  # bf16 a padded LDS core row (back.XL_ROW)
 INV_D = 2.0**-6  # 1 / HEAD_DIM, exact: FLA's mean is an fma with it
-assert HEAD_DIM == 64 and HEADS == 2 * WAVES  # a pass: a row a wave, lane = d
+assert HEAD_DIM == 64 and HEADS % WAVES == 0  # a pass: a row a wave, lane = d
 
 
 def passes(s: int) -> int:
-    """Rows a wave gates: S tokens x 16 heads over 8 waves."""
-    return s * HEADS // WAVES
+    """Rows a wave gates: S tokens x HEADS heads over WAVES waves (Q_GROUPS
+    head groups a token: 2 at TP8, 4 at TP4)."""
+    return s * Q_GROUPS
 
 
 def pass_row(k: int, wave):
     """Pass k's row of wave ``wave``: (token t, Python int; head h)."""
-    return k // 2, (k % 2) * WAVES + wave
+    return k // Q_GROUPS, (k % Q_GROUPS) * WAVES + wave
 
 
 def _ld_bf16(addr, i):

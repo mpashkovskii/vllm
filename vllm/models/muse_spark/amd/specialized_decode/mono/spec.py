@@ -216,7 +216,14 @@ ROW_Q = 0  # the qkv row blocks: q heads, k heads, v heads, o_gate heads
 ROW_K = CORE
 ROW_V = ROW_K + KV_HEADS * HEAD_DIM
 ROW_G = ROW_V + KV_HEADS * HEAD_DIM
-E_UNITS = 5  # epilogue units a token: q 0-7, q 8-15, k + v, og 0-7, og 8-15
+# A head is a wave, so a token's HEADS q heads take Q_GROUPS = HEADS / WAVES
+# epilogue units; the k + v heads one (2 * KV_HEADS <= WAVES); the og heads
+# Q_GROUPS more. E_UNITS = 2 * Q_GROUPS + 1: 5 at TP8 (q 0-7, q 8-15, k+v,
+# og 0-7, og 8-15), 9 at TP4 (four q / og groups). E_UNITS * S epilogue units
+# are striped over the NA boundary CTAs (EPI_ROUNDS).
+assert HEADS % WAVES == 0 and 2 * KV_HEADS <= WAVES
+Q_GROUPS = HEADS // WAVES  # 2 (TP8) / 4 (TP4) epilogue groups of 8 q (or og) heads
+E_UNITS = 2 * Q_GROUPS + 1  # 5 (TP8) / 9 (TP4)
 
 
 def k1_contributor0(tile: int) -> int:
@@ -226,9 +233,16 @@ def k1_contributor0(tile: int) -> int:
     return (KPARTS * tile) // K1_TPC
 
 
+def epi_rounds(s: int) -> int:
+    """Epilogue passes a boundary CTA: the E_UNITS * s epilogue units striped
+    over the NA boundary CTAs. One at TP8 (E_UNITS * s <= NA); two at TP4 where
+    the nine groups overflow (E_UNITS * 8 = 72 > 64)."""
+    return cdiv(E_UNITS * s, NA)
+
+
 assert K1_TASKS == K1_TPC * K1_GEMV_CTAS and ROWS * QKV_TILES == QKV_ROWS
 assert ROW_G + CORE == QKV_ROWS and KPART * KPARTS == HIDDEN and KPART == 4 * COLS
-assert E_UNITS * MAX_ROWS <= NA and K1_ROUNDS * 2 == K1_TPC
+assert K1_ROUNDS * 2 == K1_TPC and E_UNITS * MAX_ROWS <= epi_rounds(MAX_ROWS) * NA
 
 
 def _validate_k1_placement(blocks: int) -> None:

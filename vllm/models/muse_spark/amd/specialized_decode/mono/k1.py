@@ -57,6 +57,7 @@ from collections.abc import Mapping
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.muse_spark.amd.specialized_decode.mono import spec
@@ -86,6 +87,7 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     K1_GEMV0,
     NA,
     K1Build,
+    epi_rounds,
 )
 
 # The kernel's parameters: spec.K1_ARGS, the residual stream renamed
@@ -97,9 +99,10 @@ ABI = KernelAbi(tuple(KERNEL_NAMES.get(n, n) for n in spec.K1_ARGS))
 # and the helpers K1 shares with K2 are all in it)
 SOURCES = source_digest(".")
 REGIONS = spec.REGIONS  # debug.region_ids order of the wait records
-# ``program``'s two role branches partition the grid: every CTA runs exactly
-# one of them
-assert K1_GEMV0 == NA and E_UNITS * spec.MAX_ROWS <= NA
+# ``program``'s two role branches partition the grid: the boundary / epilogue
+# CTAs [0, NA) and the GEMV CTAs [NA, BLOCKS). The epilogue's E_UNITS * S units
+# are striped over [0, NA) (epi_rounds), so it stays within the boundary range.
+assert K1_GEMV0 == NA and E_UNITS * spec.MAX_ROWS <= epi_rounds(spec.MAX_ROWS) * NA
 
 # One CTA a CU (DESIGN_BC 5.9): every build's LDS past half a CU's
 RESIDENT_LDS = LDS_BYTES // 2 + 16
@@ -138,11 +141,18 @@ def program(c) -> None:
     # epilogue after the slice's publish
     if b < NA:
         pre = boundary.boundary_loads(c, b)
-        epi = boundary.epilogue_inputs(c, b)
+        epi0 = boundary.epilogue_inputs(c, b)  # round 0's inputs, before settle
         settle(c)
         boundary.stage_boundary(c, b, pre)
-        if b32 < E_UNITS * s:
-            epilogue.stage_epilogue(c, b32, epi)
+        # the E_UNITS * s epilogue units striped over [0, NA): CTA b runs units
+        # b, b + NA, ... (epi_rounds; one at TP8, two at TP4 where 9 groups x s
+        # overflow NA). Round 0 keeps today's pre-settle inputs, so TP8 is a
+        # no-op.
+        for r in range_constexpr(epi_rounds(s)):
+            u = b32 + r * NA
+            if u < E_UNITS * s:
+                epi = epi0 if const_expr(r == 0) else boundary.epilogue_inputs(c, u)
+                epilogue.stage_epilogue(c, u, epi)
     # -- the GEMV CTAs: their early weight rounds the first loads, then the
     # ardy polls (the late rounds go out behind the arow loads)
     if b >= K1_GEMV0:
