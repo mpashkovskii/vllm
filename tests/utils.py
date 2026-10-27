@@ -1437,6 +1437,12 @@ def multi_process_parallel(
             filter(None, [str(VLLM_PATH), os.environ.get("PYTHONPATH")])
         ),
         **{env_var: "1" for env_var in current_platform.ray_noset_device_env_vars},
+        # forward Muse Spark mono grid-width / TP overrides to the workers
+        **{
+            k: v
+            for k, v in os.environ.items()
+            if k.startswith("VLLM_MUSE_SPARK_")
+        },
     }
     ray.init(
         runtime_env={

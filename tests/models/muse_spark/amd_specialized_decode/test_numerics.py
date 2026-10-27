@@ -106,11 +106,15 @@ def _tag(runner) -> int:
 
 
 def _owner_sum(part: torch.Tensor) -> torch.Tensor:
-    """A rank's 32 owner slices [..., 32] summed in ``stage_owner``'s fp32
-    order: lane rp the 4 slices 4 rp .. in order, then the butterfly over the
-    8 lanes (xor 4, 2, 1), which every lane ends with (lane 0's order)."""
-    lane = part[..., 0::4] + part[..., 1::4]
-    lane = (lane + part[..., 2::4]) + part[..., 3::4]  # [..., 8]: lane rp
+    """A rank's RED_TASKS owner slices [..., RED_TASKS] summed in
+    ``stage_owner``'s fp32 order: lane rp the PSS_PER_LANE contiguous slices
+    PSS_PER_LANE rp .. in order (left fold), then the butterfly over the 8 lanes
+    (xor 4, 2, 1), which every lane ends with (lane 0's order). PSS_PER_LANE is
+    4 at TP8, 8 at TP4."""
+    ppl = spec.RED_TASKS // (spec.ROWS // 2)  # PSS_PER_LANE
+    lane = part[..., 0::ppl]
+    for q in range(1, ppl):
+        lane = lane + part[..., q::ppl]  # [..., 8]: lane rp's PSS_PER_LANE slices
     for off in (4, 2, 1):
         lane = lane + lane[..., [rp ^ off for rp in range(8)]]
     return lane[..., 0]
@@ -376,8 +380,12 @@ def _assert_healthy(runner) -> None:
     Collective (``_tp_checks``): only the output rank's flags are ever set
     (``runner.alarm``), so the local verdicts differ by construction."""
     with _tp_checks("the health check"):
+        from vllm.models.muse_spark.amd.specialized_decode.mono.common.debug import (
+            given_up_waits,
+        )
+
         h = runner.health.cpu().clone()
-        assert h[FAILED] == 0, h[RECORD_WORDS:].view(-1, RECORD_WORDS).nonzero()
+        assert h[FAILED] == 0, given_up_waits(runner.health.cpu(), spec.REGIONS)
         h[WAIT_BUDGET] = 0
         assert not h.any()
         assert not runner.flags.any()
@@ -590,6 +598,10 @@ def _check_step(runner, w, core, stream, pad, stream_out, branch_out, case) -> d
         big = ref_s.abs() >= 1e-3 * mag
         assert (u[big[live]] <= 1).all(), case
         assert (rb["xrow"][p].float() == 0).all()
+        # ---- isolate the pooler (its output feeds the experts)
+        pool_ref = _linear(rb["xrow"].to(dev), w["w_pool"]).cpu()
+        _pcos = ref.cos(rb["pool"][live], pool_ref[live])
+        assert _pcos > COS_STAGE, (case, "pool cos", float(_pcos))
         # chain guard: against the stock all-reduce's boundary
         _, stream_stock = _stock_boundary(attn_stock, stream, w)
         assert ref.cos(got_s[live], stream_stock.cpu()[live]) > COS_STAGE
@@ -654,7 +666,7 @@ def _check_step(runner, w, core, stream, pad, stream_out, branch_out, case) -> d
                 ref.owner_sumsq(
                     R[..., c0 : c0 + spec.ROWS].cpu(),
                     w["w_postexp"][c0 : c0 + spec.ROWS].cpu(),
-                ),
+                )[live],
                 rtol=1e-5,
                 atol=1e-30,
             )
@@ -841,7 +853,7 @@ def _k2_worker(
 @needs_gfx950
 @multi_gpu_test(num_gpus=8)
 def test_k2_tp8_matches_vllm_ops_and_replays(monkeypatch: pytest.MonkeyPatch) -> None:
-    multi_process_parallel(monkeypatch, 8, 1, _k2_worker)
+    multi_process_parallel(monkeypatch, spec.TP, 1, _k2_worker)
 
 
 @ray.remote(num_gpus=1, max_calls=1)

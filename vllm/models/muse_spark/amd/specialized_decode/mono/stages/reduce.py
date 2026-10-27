@@ -34,7 +34,7 @@ The tree sum and the per-pick sum of squares are bit-identical on every rank
 import functools
 
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 
 from vllm.models.muse_spark.amd.specialized_decode.mono.common import route_lds
 from vllm.models.muse_spark.amd.specialized_decode.mono.common.ops import (
@@ -67,7 +67,8 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
 PICK_LANES = ROWS // 2  # threads a pick: 2 of its 16 columns each
 PSS_PER_LANE = RED_TASKS // PICK_LANES  # 4 of the 32 owner slices a lane sums
 assert PSS_PER_LANE * PICK_LANES == RED_TASKS
-assert PSS_PER_LANE == 4  # a lane's slices of a rank: two 2-pair loads
+assert PSS_PER_LANE % 2 == 0  # a lane sums PSS_PER_LANE slices via 2-pair loads
+PSS_LOADS = PSS_PER_LANE // 2  # 2-pair loads a lane a rank: 2 (TP8) / 4 (TP4)
 assert TOPK * PICK_LANES == 64  # a row's picks fill one wave: S rows, S waves
 
 
@@ -165,14 +166,19 @@ def stage_owner(c, j):
             [
                 (sqx, sqx_pair(src, sl + 2 * h, pick), 2)
                 for src in range(TP)
-                for h in range(2)
+                for h in range(PSS_LOADS)
             ],
-            batch=2 * TP,
+            batch=PSS_LOADS * TP,
         )
         owns = []
         for src in range_constexpr(TP):
-            lo, hi = sq[2 * src], sq[2 * src + 1]
-            own = ((_f32(lo[0]) + _f32(lo[1])) + _f32(hi[0])) + _f32(hi[1])
+            # the rank's PSS_PER_LANE slices summed in order (left fold), as the
+            # four at TP8: ((v0 + v1) + v2) + v3, extended to eight at TP4
+            own = _f32(sq[PSS_LOADS * src][0])
+            for h in range_constexpr(PSS_LOADS):
+                ld = sq[PSS_LOADS * src + h]
+                own = own if const_expr(h == 0) else own + _f32(ld[0])
+                own = own + _f32(ld[1])
             owns.append(butterfly(own, (4, 2, 1)))
         ss = owns[0]
         for src in range_constexpr(1, TP):

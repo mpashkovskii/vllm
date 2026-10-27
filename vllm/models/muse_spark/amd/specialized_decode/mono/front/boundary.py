@@ -64,6 +64,7 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     RMS_EPS,
     ardy_pair,
     arow_elem,
+    epi_rounds,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.stages.seam import (
     blend_norm,
@@ -72,7 +73,8 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.stages.seam import (
 assert COLS == 2 * 64 and NA == HIDDEN // COLS  # a lane 2 columns of a slice
 assert NA == 64  # a lane reads one slice's partial of each sum of squares
 assert MAX_ROWS <= WAVES  # a wave a row
-assert E_UNITS * MAX_ROWS <= NA  # the epilogue CTAs are boundary CTAs
+# the epilogue CTAs are boundary CTAs: its E_UNITS * S units stripe over [0, NA)
+assert E_UNITS * MAX_ROWS <= epi_rounds(MAX_ROWS) * NA
 
 
 def _ld_f32x2(ptr, i):

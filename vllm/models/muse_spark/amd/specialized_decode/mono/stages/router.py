@@ -171,12 +171,15 @@ def stage_route(c, t):
         # the plain loads go out before the wait
         pad_t = ld_pad(a["pad"], t)
         bias = [ld_f32(a["bias"], lane + 64 * u) for u in range(PER)]
-        # expert e = lane + 64 u is rank e // 32's router row e % 32
+        # expert e = lane + 64 u is rank e // EXPERTS_RANK's router row
+        # e % EXPERTS_RANK (EXPERTS_RANK 32 at TP8, 64 at TP4)
         specs = [
             (
                 c["peer"]["rlog_own"],
                 rlog_pair(
-                    lane // EXPERTS_RANK + (64 // EXPERTS_RANK) * u, t, lane % 32
+                    lane // EXPERTS_RANK + (64 // EXPERTS_RANK) * u,
+                    t,
+                    lane % EXPERTS_RANK,
                 ),
                 1,
             )

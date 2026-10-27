@@ -15,22 +15,35 @@ launch's width, so every width of a step shares one layout and one parity
 half.
 """
 
+import os
 from dataclasses import dataclass
 
 # --------------------------------------------------------------------------
 # The model (Muse Spark Open at TP8)
 
-TP = 8
+# Tensor-parallel degree. TP8 is the model's native shard (MI355X); TP4 (for a
+# 4-GPU TP island under PP) doubles every per-rank count below. SUPPORTED_TP is
+# the set the shapes and placement are validated for. Like BLOCKS this is a
+# per-deployment constant; the runtime picks it from tensor_parallel_size.
+SUPPORTED_TP = (8, 4)
+TP = int(os.environ.get("VLLM_MUSE_SPARK_TP", "8"))
+assert TP in SUPPORTED_TP, f"TP {TP} not in {SUPPORTED_TP}"
 HIDDEN = 8192  # H: the residual stream
 MOE_HIDDEN = 4096  # the pooled width the routed experts see
-INTER = 512  # an expert's intermediate a rank (moe_intermediate_size / TP)
 EXPERTS = 256
 TOPK = 8
-EXPERTS_RANK = EXPERTS // TP  # 32 router rows a rank
-HEADS = 16  # query heads a rank (128 / TP)
-KV_HEADS = 2  # KV heads a rank (16 / TP)
 HEAD_DIM = 64
-CORE = HEADS * HEAD_DIM  # 1024: o_proj's K a rank
+# The model's full (pre-shard) counts; the per-rank shapes are these // TP.
+N_HEADS = 128  # num_attention_heads
+N_KV_HEADS = 16  # num_key_value_heads
+MOE_INTER = 4096  # moe_intermediate_size
+assert N_HEADS % TP == 0 and N_KV_HEADS % TP == 0 and MOE_INTER % TP == 0
+assert EXPERTS % TP == 0
+INTER = MOE_INTER // TP  # 512 (TP8) / 1024 (TP4): an expert's intermediate a rank
+EXPERTS_RANK = EXPERTS // TP  # 32 (TP8) / 64 (TP4) router rows a rank
+HEADS = N_HEADS // TP  # 16 (TP8) / 32 (TP4) query heads a rank
+KV_HEADS = N_KV_HEADS // TP  # 2 (TP8) / 4 (TP4) KV heads a rank
+CORE = HEADS * HEAD_DIM  # 1024 (TP8) / 2048 (TP4): o_proj's K a rank
 
 # runtime.text_shapes(text_config) must equal MUSE_SHAPES, field by field.
 MUSE_SHAPE_FIELDS = (
@@ -91,8 +104,8 @@ MAX_U = MAX_PICKS  # experts in a step's union
 # BLOCKS; a narrower grid runs more rounds per CTA (``*_ROUNDS``), never fewer
 # tasks. SUPPORTED_WIDTHS is the set the static placement is validated for.
 SUPPORTED_WIDTHS = (256, 128)
-BLOCKS = 256
-assert BLOCKS in SUPPORTED_WIDTHS
+BLOCKS = int(os.environ.get("VLLM_MUSE_SPARK_BLOCKS", "256"))
+assert BLOCKS in SUPPORTED_WIDTHS, f"BLOCKS {BLOCKS} not in {SUPPORTED_WIDTHS}"
 THREADS = 512
 WAVES = THREADS // 64  # 8
 LDS_BYTES = 160 * 1024  # a CU's LDS: one CTA's whole
@@ -117,19 +130,21 @@ def rounds(tasks: int, blocks: int = BLOCKS) -> int:
 
 O_TASKS = HIDDEN // ROWS  # 512 o_proj tasks: CTA b runs b, b + BLOCKS, ...
 NA = HIDDEN // COLS  # 64 seam CTAs [0, NA): 128 columns each
-R0 = 64  # router CTAs [R0, R0 + R_TASKS): one expert row each
-R_TASKS = EXPERTS_RANK  # 32
-P_GROUPS = MOE_HIDDEN // TP // ROWS  # 32 pooler row groups a rank
+R0 = NA  # router CTAs [R0, R0 + R_TASKS): one expert row each (after the seam)
+R_TASKS = EXPERTS_RANK  # 32 (TP8) / 64 (TP4) experts a rank
+P_GROUPS = MOE_HIDDEN // TP // ROWS  # 32 (TP8) / 64 (TP4) pooler row groups a rank
 P_PARTS = 4  # K quarters of a pooler row group
 P_K = HIDDEN // P_PARTS  # 2048
-P0 = 96  # pooler CTAs [P0, P0 + P_TASKS): g = t // P_PARTS, q = t % P_PARTS
-P_TASKS = P_GROUPS * P_PARTS  # 128
+P0 = R0 + R_TASKS  # pooler base: 96 (TP8), after the router; == BLOCKS at TP4/128
+P_TASKS = P_GROUPS * P_PARTS  # 128 (TP8) / 256 (TP4)
 UG_GROUPS = INTER // 32  # 16 ug tasks a union slot (32 columns each)
 W13_K = MOE_HIDDEN  # 4096
 W13_STEPS = W13_K // 128  # 32 (16 a K half)
 W2_STEPS = INTER // 128  # 4
 DOWN_TASKS = MOE_HIDDEN // ROWS  # 256: CTA b owns down rows 16b .. 16b + 16, ...
-DOWN_BATCH = 4  # slots of w2 in flight a wave
+DOWN_BATCH = max(1, 16 // W2_STEPS)  # slots of w2 in flight: 4 (TP8) / 2 (TP4);
+# scaled inverse to W2_STEPS so the in-flight w2 tile count (and VGPR pressure)
+# stays ~constant as INTER grows with a smaller TP
 OWN_COLS = MOE_HIDDEN // TP  # 512 pooled columns a rank owns (reduce-scatter)
 RED_TASKS = OWN_COLS // ROWS  # 32 owner CTAs [32 rank, 32 rank + 32)
 U_GROUPS = HIDDEN // TP // ROWS  # 64 unpooler row groups a rank
@@ -140,15 +155,18 @@ G_TASKS = HIDDEN // COLS  # 64 gather CTAs [0, G_TASKS)
 
 # Per-CTA task fan-out of the grid-striped K2 stages (CTA b runs b, b + BLOCKS,
 # ...). At BLOCKS = 256 every round count is today's value (o_proj 2, down /
-# unpool 1); at BLOCKS = 128 a CTA runs twice the rounds. The phase-2 roles
-# (seam / router / pooler) keep their fixed CTA ranges [0, NA), [R0, R0 +
-# R_TASKS) and [P0, ...); only the pooler, which owns the grid tail [P0, BLOCKS),
-# stripes its P_TASKS over the POOL_CTAS it has (one round when they fit).
-O_ROUNDS = rounds(O_TASKS)  # 2 (256) / 4 (128)
+# unpool 1); a narrower grid or TP4 (which doubles the per-rank task counts)
+# runs more rounds. Phase-2 seam [0, NA) and router [R0, R0 + R_TASKS) keep
+# fixed ranges; the pooler stripes its P_TASKS over the grid tail [POOL_CTA0,
+# BLOCKS). That tail is [P0, BLOCKS) while P0 < BLOCKS (TP8); at TP4/128 the
+# router fills the grid (P0 == BLOCKS), so the pooler falls back to the whole
+# grid [0, BLOCKS) and runs after the seam / router blocks on shared CTAs.
+O_ROUNDS = rounds(O_TASKS)  # 2 (256) / 4 (128) / 4 (TP4 128)
 DOWN_ROUNDS = rounds(DOWN_TASKS)  # 1 (256) / 2 (128)
-U_ROUNDS = rounds(U_TASKS)  # 1 (256) / 2 (128)
-POOL_CTAS = BLOCKS - P0  # pooler CTAs: 160 (256) / 32 (128)
-P_ROUNDS = rounds(P_TASKS, POOL_CTAS)  # 1 (256) / 4 (128)
+U_ROUNDS = rounds(U_TASKS)  # 1 (256) / 2 (TP8 128) / 4 (TP4 128)
+POOL_CTA0 = P0 if P0 < BLOCKS else 0  # pooler tail start (0 when router fills grid)
+POOL_CTAS = BLOCKS - POOL_CTA0  # pooler CTAs: 160 (256) / 32 (128) / 128 (TP4 128)
+P_ROUNDS = rounds(P_TASKS, POOL_CTAS)  # 1 (256) / 4 (128) / 2 (TP4 128)
 
 
 def ug_cta0(s: int) -> int:
@@ -187,11 +205,27 @@ K1_GEMV_CTAS = BLOCKS - K1_GEMV0  # 192
 K1_TPC = K1_TASKS // K1_GEMV_CTAS  # 12 tasks a GEMV CTA: tau = 12 g + i
 K1_ROUNDS = K1_TPC // 2  # 6 rounds: waves 0-3 take task 2r, waves 4-7 2r + 1
 K1_MAXC = 2  # GEMV CTAs contributing to a tile
+# The qkv GEMV streams its K1_TPC tasks through LDS a chunk at a time so ``xa``
+# (sized by the chunk, not K1_TPC) and the weight rounds in flight stay within a
+# CU's budget at any TP / grid width. K1_CHUNK = 12 is the TP8/256 K1_TPC (so
+# that config is one chunk -- unchanged) and divides K1_TPC in every supported
+# config (12/1, 36/3, 24/2, 72/6).
+K1_CHUNK = 12  # tasks staged a pass (even; <= the LDS-bound ~18 at s=8)
+assert K1_CHUNK % 2 == 0 and K1_TPC % K1_CHUNK == 0
+K1_NCHUNK = K1_TPC // K1_CHUNK  # LDS passes a GEMV CTA: 1 (TP8/256) .. 6 (TP4/128)
+K1_CHUNK_ROUNDS = K1_CHUNK // 2  # 6 MFMA rounds a chunk
 ROW_Q = 0  # the qkv row blocks: q heads, k heads, v heads, o_gate heads
 ROW_K = CORE
 ROW_V = ROW_K + KV_HEADS * HEAD_DIM
 ROW_G = ROW_V + KV_HEADS * HEAD_DIM
-E_UNITS = 5  # epilogue units a token: q 0-7, q 8-15, k + v, og 0-7, og 8-15
+# A head is a wave, so a token's HEADS q heads take Q_GROUPS = HEADS / WAVES
+# epilogue units; the k + v heads one (2 * KV_HEADS <= WAVES); the og heads
+# Q_GROUPS more. E_UNITS = 2 * Q_GROUPS + 1: 5 at TP8 (q 0-7, q 8-15, k+v,
+# og 0-7, og 8-15), 9 at TP4 (four q / og groups). E_UNITS * S epilogue units
+# are striped over the NA boundary CTAs (EPI_ROUNDS).
+assert HEADS % WAVES == 0 and 2 * KV_HEADS <= WAVES
+Q_GROUPS = HEADS // WAVES  # 2 (TP8) / 4 (TP4) epilogue groups of 8 q (or og) heads
+E_UNITS = 2 * Q_GROUPS + 1  # 5 (TP8) / 9 (TP4)
 
 
 def k1_contributor0(tile: int) -> int:
@@ -201,9 +235,16 @@ def k1_contributor0(tile: int) -> int:
     return (KPARTS * tile) // K1_TPC
 
 
+def epi_rounds(s: int) -> int:
+    """Epilogue passes a boundary CTA: the E_UNITS * s epilogue units striped
+    over the NA boundary CTAs. One at TP8 (E_UNITS * s <= NA); two at TP4 where
+    the nine groups overflow (E_UNITS * 8 = 72 > 64)."""
+    return cdiv(E_UNITS * s, NA)
+
+
 assert K1_TASKS == K1_TPC * K1_GEMV_CTAS and ROWS * QKV_TILES == QKV_ROWS
 assert ROW_G + CORE == QKV_ROWS and KPART * KPARTS == HIDDEN and KPART == 4 * COLS
-assert E_UNITS * MAX_ROWS <= NA and K1_ROUNDS * 2 == K1_TPC
+assert K1_ROUNDS * 2 == K1_TPC and E_UNITS * MAX_ROWS <= epi_rounds(MAX_ROWS) * NA
 
 
 def _validate_k1_placement(blocks: int) -> None:
@@ -254,19 +295,30 @@ def n_comb(S: int) -> int:
     return HEADS * S
 
 
+def ncomb_rounds(S: int, blocks: int = BLOCKS) -> int:
+    """Combine passes a CTA: 1 while n_comb <= blocks (TP8), 2 at TP4 where the
+    HEADS * S combine tasks (HEADS 32) overflow a 128-wide grid."""
+    return cdiv(n_comb(S), blocks)
+
+
 def C0(S: int, blocks: int = BLOCKS) -> int:
-    """The first combine CTA: [C0, blocks) runs one (token, q head) each."""
-    return blocks - n_comb(S)
+    """The first combine CTA. When the n_comb combine tasks fit the grid they sit
+    at the top [C0, blocks), one (token, q head) each (C0 = blocks - n_comb, the
+    split units get the low CTAs). When they overflow (TP4) C0 is 0: every CTA
+    runs ``ncomb_rounds`` tasks b - C0, + blocks, ... (< n_comb)."""
+    return max(0, blocks - n_comb(S))
 
 
 def _validate_split_placement(blocks: int) -> None:
     """The split-KV core placement fits a ``blocks``-wide grid at every width S:
-    the split units [0, n_units) and the combine CTAs [C0, blocks) both fit, and
-    a unit has at least one page part. The two ranges may overlap (they already
-    do at 256, S = 8); a CTA holding both runs its unit first, so overlap needs
-    no separation -- only C0 >= 0 (n_comb <= blocks)."""
+    the split units [0, n_units) fit in one pass, and the n_comb combine tasks
+    are covered by ``ncomb_rounds`` grid-striped passes from C0. The split and
+    combine ranges may overlap (they already do at 256, S = 8); a CTA holding
+    both runs its unit first, so overlap needs no separation."""
     for s in range(1, MAX_ROWS + 1):
-        assert n_comb(s) <= blocks, (blocks, s)  # C0 >= 0
+        c0 = C0(s, blocks)
+        assert 0 <= c0 < blocks, (blocks, s)
+        assert ncomb_rounds(s, blocks) * blocks - c0 >= n_comb(s), (blocks, s)
         for w in (False, True):
             assert nsplit(s, w, blocks) >= 1, (blocks, s, w)
             assert n_units(s, w, blocks) <= blocks, (blocks, s, w)
@@ -313,10 +365,12 @@ def _validate_k2_placement(blocks: int) -> None:
     import, so a narrower grid (MI350P's 128) is proven before any kernel builds.
     The split-KV core and K1 GEMV placement are validated separately (they need
     their own width rework; windowed split overflows a 128-wide grid)."""
-    pool_ctas = blocks - P0
-    # phase-2 roles seam [0, NA), router [R0, R0 + R_TASKS), pooler [P0, blocks)
-    # are disjoint and within the grid
-    assert NA <= R0 and R0 + R_TASKS <= P0 and blocks > P0, blocks
+    # phase-2 seam [0, NA) and router [R0, R0 + R_TASKS) fit (both run once); the
+    # router sits right after the seam and must fit the grid (it does at TP4/128
+    # exactly: [64, 128)).
+    assert NA <= R0 and blocks >= R0 + R_TASKS, blocks
+    pool_cta0 = P0 if blocks > P0 else 0  # pooler tail start
+    pool_ctas = blocks - pool_cta0
     assert blocks >= G_TASKS and pool_ctas > 0, blocks
     # grid-striped stages (CTA b: b, b + blocks, ...) tile their tasks exactly
     assert O_TASKS % blocks == 0 and DOWN_TASKS % blocks == 0, blocks
@@ -430,6 +484,14 @@ class K2Build:
     def c0(self) -> int:
         """A split build's first combine CTA."""
         return C0(self.tokens)
+
+    def n_comb(self) -> int:
+        """A split build's combine tasks (one a (token, q head))."""
+        return n_comb(self.tokens)
+
+    def ncomb_rounds(self) -> int:
+        """Combine passes a CTA (1 at TP8, 2 at TP4)."""
+        return ncomb_rounds(self.tokens)
 
     def kernel_name(self) -> str:
         """The kernel symbol: one per build. A Phase A build ("tensor") keeps
@@ -569,7 +631,7 @@ SCRATCH_PAIRS = (
     ("bss", NA * _MT),  # j*MT + t: fp32 sum of new_stream^2 over slice j
     ("ppart", P_GROUPS * (P_PARTS - 1) * _MT * ROWS),  # ((g*3 + q-1)*MT + t)*16 + r
     ("route", _MT * 16),  # t*16 + k: id; t*16 + 8 + k: fp32 weight
-    ("inter", _MP * 64),  # pick*64 + 4g + w: a2 fp4 words
+    ("inter", _MP * (INTER // 8)),  # pick*INTER_WORDS + 4g + w: a2 fp4 words
     ("isc", _MP * UG_GROUPS),  # pick*16 + g: a2 e8m0 code
     (None, RED_TASKS * _MP),  # reserved (the retired rank-local ``pss``)
     ("upart", U_GROUPS * (U_PARTS - 1) * _MT * ROWS),  # ((g*3 + q-1)*MT + t)*16 + r

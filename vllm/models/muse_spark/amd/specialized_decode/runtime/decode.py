@@ -356,19 +356,23 @@ class SpecializedDecode:
         """This step's plan, or None to run vLLM's layers.
 
         Steps that run vLLM's layers:
-        - pipeline-parallel stage inputs, and steps before a KV cache is bound
-          (profiling, dummy runs);
+        - steps before a KV cache is bound (profiling, dummy runs);
         - PIECEWISE steps (captured without attention metadata);
         - widths without kernels (more than MAX_ROWS rows);
         - steps that are not pure decode / uniform verify steps of whole requests
           (``step_reason``).
+
+        A pipeline-parallel stage input (``intermediate_tensors`` not None) runs
+        the kernels too: this stage's layer range (``start_layer .. end_layer``)
+        takes the previous stage's residual stream, the same plain stream the
+        first layer takes without PP. Phase A serves it (K1 is refused under PP).
 
         Eager steps run the kernels too (enforce-eager, widths without a graph,
         MRV2's warm-ups before each capture). Every predicate is the same on all
         TP ranks: the kernels' mailboxes need every rank on one path. Under FULL
         graphs this runs at capture only and the plan is baked in.
         """
-        if intermediate_tensors is not None or self._kv is None:
+        if self._kv is None:
             return None
         if not is_forward_context_available():
             return None
