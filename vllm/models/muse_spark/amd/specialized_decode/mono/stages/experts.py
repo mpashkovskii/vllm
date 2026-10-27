@@ -97,7 +97,8 @@ W13_ROWS = 2 * INTER  # an expert's w13 rows: gate 512 | up 512
 W13_EXPERT_DWORDS = W13_ROWS * W13_K // 8  # 524288: an expert's fp4 w13
 W2_EXPERT_DWORDS = MOE_HIDDEN * INTER // 8  # 262144: an expert's fp4 w2
 W2_SCALE_COLS = INTER // 32  # 16 e8m0 codes a w2 row
-INTER_WORDS = INTER // 8  # 64 fp4 words of a pick's a2 row
+INTER_WORDS = INTER // 8  # 64 (TP8) / 128 (TP4) fp4 words of a pick's a2 row
+WPP = INTER_WORDS // 64  # waves a pick spans in load_inter: 1 (TP8) / 2 (TP4)
 UP_GROUP0 = INTER // ROWS  # 32: the first up row group of an expert
 # the weights' bytes (runtime.guards checks their shapes): the num_records of
 # their buffer resources, expert EXPERTS past the end
@@ -111,8 +112,9 @@ ISC_FROM_ROUTE = (_LAY["isc"][0] - _LAY["route"][0]) // PAIR_BYTES
 
 assert MAX_U * TOPK == THREADS and EXPERTS <= THREADS and MAX_U <= THREADS
 assert W13_STEPS % 2 == 0 and HALF_STEPS % 2 == 0 and WAVES == 8
-# load_inter: a wave's 64 INTER words are one pick's (its spec is wave-uniform)
-assert INTER_WORDS == 64 and THREADS % INTER_WORDS == 0
+# load_inter: a pick's INTER_WORDS span WPP waves (64 words a wave); its spec is
+# wave-uniform (pick = wave // WPP, same across a wave's 64 lanes)
+assert INTER_WORDS % 64 == 0 and THREADS % INTER_WORDS == 0 and WAVES % WPP == 0
 assert ISC_FROM_ROUTE > 0 and (_LAY["isc"][0] - _LAY["route"][0]) % PAIR_BYTES == 0
 # _down_slot: a down lane's w2 code sits at byte 2 (st % 2) + rgd % 2 of its word
 assert all(
@@ -479,8 +481,8 @@ def load_inter(c):
     nc = s * TOPK * UG_GROUPS
     specs, oks = [], []
     for i in range_constexpr(nw // THREADS):
-        idx = tid32 + THREADS * i  # pick idx // 64 = wave + 8 i
-        pick = fx.Int32(wave) + (THREADS // INTER_WORDS) * i
+        idx = tid32 + THREADS * i  # pick = idx // INTER_WORDS = wave // WPP + ...
+        pick = fx.Int32(wave) // WPP + (THREADS // INTER_WORDS) * i
         sp, ok = _inter_spec(rt, route, inter, idx, pick)
         specs.append(sp)
         oks.append(ok)
