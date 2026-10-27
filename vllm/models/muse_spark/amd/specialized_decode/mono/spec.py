@@ -629,7 +629,7 @@ SCRATCH_PAIRS = (
     ("bss", NA * _MT),  # j*MT + t: fp32 sum of new_stream^2 over slice j
     ("ppart", P_GROUPS * (P_PARTS - 1) * _MT * ROWS),  # ((g*3 + q-1)*MT + t)*16 + r
     ("route", _MT * 16),  # t*16 + k: id; t*16 + 8 + k: fp32 weight
-    ("inter", _MP * 64),  # pick*64 + 4g + w: a2 fp4 words
+    ("inter", _MP * (INTER // 8)),  # pick*INTER_WORDS + 4g + w: a2 fp4 words
     ("isc", _MP * UG_GROUPS),  # pick*16 + g: a2 e8m0 code
     (None, RED_TASKS * _MP),  # reserved (the retired rank-local ``pss``)
     ("upart", U_GROUPS * (U_PARTS - 1) * _MT * ROWS),  # ((g*3 + q-1)*MT + t)*16 + r
