@@ -142,7 +142,9 @@ W13_K = MOE_HIDDEN  # 4096
 W13_STEPS = W13_K // 128  # 32 (16 a K half)
 W2_STEPS = INTER // 128  # 4
 DOWN_TASKS = MOE_HIDDEN // ROWS  # 256: CTA b owns down rows 16b .. 16b + 16, ...
-DOWN_BATCH = 4  # slots of w2 in flight a wave
+DOWN_BATCH = max(1, 16 // W2_STEPS)  # slots of w2 in flight: 4 (TP8) / 2 (TP4);
+# scaled inverse to W2_STEPS so the in-flight w2 tile count (and VGPR pressure)
+# stays ~constant as INTER grows with a smaller TP
 OWN_COLS = MOE_HIDDEN // TP  # 512 pooled columns a rank owns (reduce-scatter)
 RED_TASKS = OWN_COLS // ROWS  # 32 owner CTAs [32 rank, 32 rank + 32)
 U_GROUPS = HIDDEN // TP // ROWS  # 64 unpooler row groups a rank
