@@ -15,6 +15,7 @@ launch's width, so every width of a step shares one layout and one parity
 half.
 """
 
+import os
 from dataclasses import dataclass
 
 # --------------------------------------------------------------------------
@@ -25,8 +26,8 @@ from dataclasses import dataclass
 # the set the shapes and placement are validated for. Like BLOCKS this is a
 # per-deployment constant; the runtime picks it from tensor_parallel_size.
 SUPPORTED_TP = (8, 4)
-TP = 8
-assert TP in SUPPORTED_TP
+TP = int(os.environ.get("VLLM_MUSE_SPARK_TP", "8"))
+assert TP in SUPPORTED_TP, f"TP {TP} not in {SUPPORTED_TP}"
 HIDDEN = 8192  # H: the residual stream
 MOE_HIDDEN = 4096  # the pooled width the routed experts see
 EXPERTS = 256
@@ -103,8 +104,8 @@ MAX_U = MAX_PICKS  # experts in a step's union
 # BLOCKS; a narrower grid runs more rounds per CTA (``*_ROUNDS``), never fewer
 # tasks. SUPPORTED_WIDTHS is the set the static placement is validated for.
 SUPPORTED_WIDTHS = (256, 128)
-BLOCKS = 256
-assert BLOCKS in SUPPORTED_WIDTHS
+BLOCKS = int(os.environ.get("VLLM_MUSE_SPARK_BLOCKS", "256"))
+assert BLOCKS in SUPPORTED_WIDTHS, f"BLOCKS {BLOCKS} not in {SUPPORTED_WIDTHS}"
 THREADS = 512
 WAVES = THREADS // 64  # 8
 LDS_BYTES = 160 * 1024  # a CU's LDS: one CTA's whole
@@ -199,6 +200,15 @@ K1_GEMV_CTAS = BLOCKS - K1_GEMV0  # 192
 K1_TPC = K1_TASKS // K1_GEMV_CTAS  # 12 tasks a GEMV CTA: tau = 12 g + i
 K1_ROUNDS = K1_TPC // 2  # 6 rounds: waves 0-3 take task 2r, waves 4-7 2r + 1
 K1_MAXC = 2  # GEMV CTAs contributing to a tile
+# The qkv GEMV streams its K1_TPC tasks through LDS a chunk at a time so ``xa``
+# (sized by the chunk, not K1_TPC) and the weight rounds in flight stay within a
+# CU's budget at any TP / grid width. K1_CHUNK = 12 is the TP8/256 K1_TPC (so
+# that config is one chunk -- unchanged) and divides K1_TPC in every supported
+# config (12/1, 36/3, 24/2, 72/6).
+K1_CHUNK = 12  # tasks staged a pass (even; <= the LDS-bound ~18 at s=8)
+assert K1_CHUNK % 2 == 0 and K1_TPC % K1_CHUNK == 0
+K1_NCHUNK = K1_TPC // K1_CHUNK  # LDS passes a GEMV CTA: 1 (TP8/256) .. 6 (TP4/128)
+K1_CHUNK_ROUNDS = K1_CHUNK // 2  # 6 MFMA rounds a chunk
 ROW_Q = 0  # the qkv row blocks: q heads, k heads, v heads, o_gate heads
 ROW_K = CORE
 ROW_V = ROW_K + KV_HEADS * HEAD_DIM

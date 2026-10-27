@@ -74,7 +74,7 @@ from pathlib import Path
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.muse_spark.amd.specialized_decode.mono import spec
@@ -212,7 +212,7 @@ def program(c, core: str = "tensor") -> None:
     if const_expr(core != "split"):
         settle(c)  # the context words' wait behind the core's and o_proj's loads
     back.load_core(c, core, core_pre)
-    for r in range(O_ROUNDS):
+    for r in range_constexpr(O_ROUNDS):
         back.stage_o(c, b + r * BLOCKS, ops[r])
     # -- phase 2: the seam (and routing), the router rows, the pooler
     if b < NA:
@@ -228,7 +228,7 @@ def program(c, core: str = "tensor") -> None:
     # at 256 (b - P0 < P_TASKS reproduces the old [P0, P0 + P_TASKS) range), four
     # at 128 where the tail is only POOL_CTAS = 32 wide.
     if b >= P0:
-        for r in range(P_ROUNDS):
+        for r in range_constexpr(P_ROUNDS):
             t = b - P0 + r * POOL_CTAS
             if t < P_TASKS:
                 pops = pool.pool_loads(c, t)
@@ -251,7 +251,7 @@ def program(c, core: str = "tensor") -> None:
     # 128). NOTE: each run_down re-issues load_inter; it polls already-current
     # INTER pairs, so a second round is correct but redundant -- fold load_inter
     # out of the round loop once the 128 build is validated (#63712).
-    for r in range(DOWN_ROUNDS):
+    for r in range_constexpr(DOWN_ROUNDS):
         experts.run_down(c, b32 + r * BLOCKS, nu)
     # -- phase 4: owner reduce, unpooler (weights before the reduce's waits),
     # gather
@@ -262,7 +262,7 @@ def program(c, core: str = "tensor") -> None:
     j = b32 - (RED_TASKS * c["rank"] & fx.Int32(BLOCKS - 1))
     if (j >= 0) & (j < RED_TASKS):
         reduce.stage_owner(c, j)
-    for r in range(U_ROUNDS):
+    for r in range_constexpr(U_ROUNDS):
         unpool.stage_unpool(c, b + r * BLOCKS, uops[r])
     if b < G_TASKS:
         unpool.stage_gather(c, b)

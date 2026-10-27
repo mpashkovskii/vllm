@@ -47,7 +47,7 @@ the staging pass and the task sums are here.
 import functools
 
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 from vllm.models.muse_spark.amd.specialized_decode.mono.common.ops import (
     ld_dev,
@@ -63,7 +63,10 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     AROW,
     COLS,
     HIDDEN,
+    K1_CHUNK,
+    K1_CHUNK_ROUNDS,
     K1_MAXC,
+    K1_NCHUNK,
     K1_ROUNDS,
     K1_TPC,
     KPART,
@@ -81,10 +84,10 @@ XA_ROW = KPART + gemv.LDS_PAD  # bf16 a padded LDS K part row (520)
 X4 = KPART // 8  # dwordx4 a K part row (64)
 CHUNKS = KPART // gemv.KCH  # 4 chunks a K part: one a wave of a half
 SLICES = KPART // COLS  # boundary slices (``ardy`` flags) a K part covers
-EARLY = 4  # weight rounds issued at entry; the rest after the arow loads
+EARLY = 4  # weight rounds issued at entry of chunk 0; the rest after arow loads
 assert CHUNKS * 2 == WAVES and K1_ROUNDS * 2 == K1_TPC
 assert SLICES * K1_TPC <= THREADS  # a flag a polling thread
-assert 0 < EARLY < K1_ROUNDS
+assert 0 < EARLY < K1_CHUNK_ROUNDS
 
 
 def tau_of(g, i):
@@ -100,7 +103,7 @@ def lds_struct(s: int):
 
     @fx.struct
     class QkvLds:
-        xa: fx.Array[fx.Int32, K1_TPC * s * XA_ROW // 2, 16]
+        xa: fx.Array[fx.Int32, K1_CHUNK * s * XA_ROW // 2, 16]
 
     return QkvLds
 
@@ -154,14 +157,15 @@ def _stage_ij(v, s):
     return v // (s * X4), v // X4 % s, v % X4
 
 
-def stage_rows(c, g) -> list:
-    """The one staging pass: the ``arow`` rows (device scope: the boundary
-    CTAs of this launch wrote them) of the CTA's 12 K parts -> LDS ``xa``, 16
-    B a thread a round (12 S 64 dwordx4: 12 rounds at S = 8), every round's
-    load issued before the first ds_write, then one barrier. The K parts are
-    (12 g + i) % 16, derived from g in-kernel. Between the loads and the
-    ds_writes it issues the late weight rounds (EARLY ..) and returns them:
-    younger than the ``arow`` loads, they stay in flight through the
+def stage_rows(c, g, ch, late) -> list:
+    """One staging pass for chunk ``ch``: the ``arow`` rows (device scope: the
+    boundary CTAs of this launch wrote them) of the chunk's K1_CHUNK K parts ->
+    LDS ``xa``, local task il in [0, K1_CHUNK) at row (il S + t); the global task
+    is ch*K1_CHUNK + il and its K part (tau % 16) is derived from g in-kernel.
+    Every load is issued before the first ds_write, then one barrier. Between the
+    loads and the ds_writes it issues the weight rounds ``late`` (a global round
+    range, or None for a chunk whose weights were loaded up front) and returns
+    them: younger than the ``arow`` loads, they stay in flight through the
     ds_writes and the barrier.
 
     Not ``ops.batched_rounds``: its last round's store is predicated (v <
@@ -172,21 +176,21 @@ def stage_rows(c, g) -> list:
     s, tid = c["S"], c["tid"]
     arow = c["scr"][AROW]
     xa = c["lds"][STAGE]["xa"]
-    total = K1_TPC * s * X4
+    total = K1_CHUNK * s * X4
     vs = [fx.min(tid + THREADS * i, total - 1) for i in range(cdiv(total, THREADS))]
     got = []
     for v in vs:
-        i, t, x = _stage_ij(v, s)
-        kp = tau_of(g, i) % KPARTS
+        il, t, x = _stage_ij(v, s)
+        kp = tau_of(g, ch * K1_CHUNK + il) % KPARTS
         word = (t * HIDDEN + kp * KPART + 8 * x) // 2
         got.append(fx.Vector(ld_dev(arow, word, 4)))
     rocdl.sched_barrier(0)
-    late = qkv_loads(c, g, range(EARLY, K1_ROUNDS))
+    late_ops = qkv_loads(c, g, late) if late is not None else []
     for v, w in zip(vs, got):
-        i, t, x = _stage_ij(v, s)
-        fx.ptr_store(w, xa + ((i * s + t) * XA_ROW + 8 * x) // 2)
+        il, t, x = _stage_ij(v, s)
+        fx.ptr_store(w, xa + ((il * s + t) * XA_ROW + 8 * x) // 2)
     gpu.barrier()
-    return late
+    return late_ops
 
 
 @traced
@@ -233,25 +237,33 @@ def stage_qkv(c, g, ops) -> None:
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     qpart = c["scr"]["qpart"]
     _poll_ardy(c, g)
-    ops = ops + stage_rows(c, g)
     r16 = tid % ROWS
     t = tid // ROWS
     tc = fx.min(t, s - 1)  # threads past S read token S - 1's (in bounds)
     live = t < s
     zero = fx.Float32(0.0)
     part = zero
-    for r in range_constexpr(K1_ROUNDS):
-        acc = _mfmas(c, r, ops[r])
-        fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-        gpu.barrier()
-        for h in range_constexpr(2):
-            i = 2 * r + h
-            part = part + row_sum(red, r16, tc, range(CHUNKS * h, CHUNKS * (h + 1)))
-            tile, _ = task(g, i)
-            last = last_of_tile(g, i)
-            put = live if last is True else live & last
-            if put:
-                pair = qpart_pair(tile, g - contributors(tile)[0], t, r16)
-                c["put"](qpart, pair, part)
-            part = zero if last is True else fx.Float32(last.select(zero, part))
-        gpu.barrier()
+    for ch in range_constexpr(K1_NCHUNK):
+        base = ch * K1_CHUNK_ROUNDS  # global round of this chunk's local round 0
+        if const_expr(ch == 0):
+            # chunk 0 keeps today's early/late split (``ops`` are its EARLY
+            # rounds), so the one-chunk TP8/256 build is byte-for-byte unchanged
+            w = ops + stage_rows(c, g, 0, range(EARLY, K1_CHUNK_ROUNDS))
+        else:
+            w = qkv_loads(c, g, range(base, base + K1_CHUNK_ROUNDS))
+            stage_rows(c, g, ch, None)
+        for rl in range_constexpr(K1_CHUNK_ROUNDS):
+            acc = _mfmas(c, rl, w[rl])
+            fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            for h in range_constexpr(2):
+                ig = ch * K1_CHUNK + 2 * rl + h  # the global task
+                part = part + row_sum(red, r16, tc, range(CHUNKS * h, CHUNKS * (h + 1)))
+                tile, _ = task(g, ig)
+                last = last_of_tile(g, ig)
+                put = live if last is True else live & last
+                if put:
+                    pair = qpart_pair(tile, g - contributors(tile)[0], t, r16)
+                    c["put"](qpart, pair, part)
+                part = zero if last is True else fx.Float32(last.select(zero, part))
+            gpu.barrier()
