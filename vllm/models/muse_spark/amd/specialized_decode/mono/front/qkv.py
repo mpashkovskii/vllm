@@ -263,7 +263,15 @@ def stage_qkv(c, g, ops) -> None:
                 last = last_of_tile(g, ig)
                 put = live if last is True else live & last
                 if put:
-                    pair = qpart_pair(tile, g - contributors(tile)[0], t, r16)
-                    c["put"](qpart, pair, part)
+                    first0 = contributors(tile)[0]
+                    c["put"](qpart, qpart_pair(tile, g - first0, t, r16), part)
+                    # When K1_TPC > KPARTS (128 / TP4) a tile can fall wholly in
+                    # one GEMV CTA, so it has no index-1 contributor. Write that
+                    # partial as zero so the epilogue's fixed two-pair poll ends
+                    # (p_0 + p_1 = part + 0). Never taken at 256 (every tile has
+                    # two contributors). The owning CTA is contributor 0.
+                    single = first0 == (KPARTS * tile + KPARTS - 1) // K1_TPC
+                    if single:
+                        c["put"](qpart, qpart_pair(tile, 1, t, r16), zero)
                 part = zero if last is True else fx.Float32(last.select(zero, part))
             gpu.barrier()

@@ -376,8 +376,12 @@ def _assert_healthy(runner) -> None:
     Collective (``_tp_checks``): only the output rank's flags are ever set
     (``runner.alarm``), so the local verdicts differ by construction."""
     with _tp_checks("the health check"):
+        from vllm.models.muse_spark.amd.specialized_decode.mono.common.debug import (
+            given_up_waits,
+        )
+
         h = runner.health.cpu().clone()
-        assert h[FAILED] == 0, h[RECORD_WORDS:].view(-1, RECORD_WORDS).nonzero()
+        assert h[FAILED] == 0, given_up_waits(runner.health.cpu(), spec.REGIONS)
         h[WAIT_BUDGET] = 0
         assert not h.any()
         assert not runner.flags.any()
