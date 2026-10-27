@@ -122,6 +122,9 @@ def test_an_unknown_backend_is_refused(monokernel):
 
 def test_supported_configs(on_mi355x, monkeypatch):
     assert specialized_decode_config(vllm_config()) == DecodeConfig(1, ALL_WIDTHS)
+    # pipeline parallelism with Phase A (the default front) is served
+    cfg = vllm_config(**{"parallel_config.pipeline_parallel_size": 2})
+    assert specialized_decode_config(cfg) == DecodeConfig(1, ALL_WIDTHS)
     # widths the scheduler can never batch are not built
     cfg = vllm_config(**{"scheduler_config.max_num_seqs": 2})
     assert specialized_decode_config(cfg) == DecodeConfig(1, (1, 2))
@@ -156,7 +159,19 @@ _KINDS = _text().layer_types
 _REFUSALS = [
     # 1-9 parallelism
     ({"parallel_config.tensor_parallel_size": 4}, {}, "TP 4 (TP8 only)"),
-    ({"parallel_config.pipeline_parallel_size": 2}, {}, "pipeline parallelism"),
+    # PP is served with Phase A (the default front); only the K1 front, which
+    # fuses with the previous layer's boundary, is refused under PP
+    (
+        {
+            "parallel_config.pipeline_parallel_size": 2,
+            "additional_config": {
+                "decode_backend": "latency_specialized",
+                "mono_front": "k1",
+            },
+        },
+        {},
+        "pipeline parallelism with the K1 front",
+    ),
     ({"parallel_config.data_parallel_size": 2}, {}, "data parallelism"),
     ({"parallel_config.enable_expert_parallel": True}, {}, "expert parallelism"),
     ({"parallel_config.enable_eplb": True}, {}, "EPLB"),
@@ -745,6 +760,8 @@ def test_plan_runs_the_kernels_of_its_width(monkeypatch, mode):
     assert step.layer(0) is None and step.layer(3) is None
     # M-RoPE positions [3, T]: the width is the last dim
     assert decode.plan(torch.zeros(3, 4), None) is not None
+    # a pipeline stage's input (intermediate tensors) runs the stage's kernels
+    assert decode.plan(torch.zeros(4), object()) is not None
 
 
 def test_plan_runs_a_dspark_verify_step(monkeypatch):
@@ -763,7 +780,6 @@ def test_plan_runs_a_dspark_verify_step(monkeypatch):
         (CUDAGraphMode.NONE, 3, _metadata(3, 1), None),  # no width 3 built here
         (CUDAGraphMode.NONE, 4, _metadata(4, 1, num_prefills=1), None),
         (CUDAGraphMode.FULL, 4, _metadata(4, 1, num_extends=1), None),
-        (CUDAGraphMode.NONE, 4, None, object()),  # a pipeline stage's input
         (CUDAGraphMode.NONE, 4, {}, None),  # a profile / dummy run
     ],
 )

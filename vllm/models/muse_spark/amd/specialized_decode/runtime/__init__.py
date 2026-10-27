@@ -121,9 +121,21 @@ def refuse_config(vllm_config) -> list[str]:
     text = mc.hf_text_config
     reduce_dtype = envs.VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE
     quant = vllm_config.quant_config
+    # Pipeline parallelism: each stage runs its own layer range (start_layer ..
+    # end_layer) inside the stock layer loop, so Phase A (the default front)
+    # serves it -- every kernel layer takes the plain stream the previous layer
+    # (or the stage input) hands it. The K1 front fuses with the previous
+    # layer's deferred boundary, which a stage boundary (a plain tensor off the
+    # network) does not carry, so it is still refused under PP.
+    extra = vllm_config.additional_config
+    mono_front = extra.get("mono_front", "stock") if isinstance(extra, dict) else "stock"
     checks = (
         (pc.tensor_parallel_size != TP, f"TP {pc.tensor_parallel_size} (TP{TP} only)"),
-        (pc.pipeline_parallel_size != 1, "pipeline parallelism"),
+        (
+            pc.pipeline_parallel_size != 1 and mono_front != "stock",
+            "pipeline parallelism with the K1 front (mono_front=k1); the default "
+            "Phase A front serves pipeline parallelism",
+        ),
         (pc.data_parallel_size != 1, "data parallelism"),
         (pc.enable_expert_parallel, "expert parallelism"),
         (pc.enable_eplb, "EPLB"),
