@@ -307,7 +307,10 @@ def ug_loads(c, task, nu):
     sw = [
         fx.Int32(
             bo.buffer_load(
-                r_s, w13_scale_word(e, rg, st0 + i, lane), vec_width=1, dtype=T.i32
+                r_s,
+                w13_scale_word(e, rg, st0 + i, lane, rows=W13_ROWS),
+                vec_width=1,
+                dtype=T.i32,
             )
         )
         for i in range(0, HALF_STEPS, 2)

@@ -666,7 +666,7 @@ def _check_step(runner, w, core, stream, pad, stream_out, branch_out, case) -> d
                 ref.owner_sumsq(
                     R[..., c0 : c0 + spec.ROWS].cpu(),
                     w["w_postexp"][c0 : c0 + spec.ROWS].cpu(),
-                ),
+                )[live],
                 rtol=1e-5,
                 atol=1e-30,
             )
