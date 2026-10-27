@@ -130,13 +130,13 @@ def rounds(tasks: int, blocks: int = BLOCKS) -> int:
 
 O_TASKS = HIDDEN // ROWS  # 512 o_proj tasks: CTA b runs b, b + BLOCKS, ...
 NA = HIDDEN // COLS  # 64 seam CTAs [0, NA): 128 columns each
-R0 = 64  # router CTAs [R0, R0 + R_TASKS): one expert row each
-R_TASKS = EXPERTS_RANK  # 32
-P_GROUPS = MOE_HIDDEN // TP // ROWS  # 32 pooler row groups a rank
+R0 = NA  # router CTAs [R0, R0 + R_TASKS): one expert row each (after the seam)
+R_TASKS = EXPERTS_RANK  # 32 (TP8) / 64 (TP4) experts a rank
+P_GROUPS = MOE_HIDDEN // TP // ROWS  # 32 (TP8) / 64 (TP4) pooler row groups a rank
 P_PARTS = 4  # K quarters of a pooler row group
 P_K = HIDDEN // P_PARTS  # 2048
-P0 = 96  # pooler CTAs [P0, P0 + P_TASKS): g = t // P_PARTS, q = t % P_PARTS
-P_TASKS = P_GROUPS * P_PARTS  # 128
+P0 = R0 + R_TASKS  # pooler base: 96 (TP8), after the router; == BLOCKS at TP4/128
+P_TASKS = P_GROUPS * P_PARTS  # 128 (TP8) / 256 (TP4)
 UG_GROUPS = INTER // 32  # 16 ug tasks a union slot (32 columns each)
 W13_K = MOE_HIDDEN  # 4096
 W13_STEPS = W13_K // 128  # 32 (16 a K half)
@@ -153,15 +153,18 @@ G_TASKS = HIDDEN // COLS  # 64 gather CTAs [0, G_TASKS)
 
 # Per-CTA task fan-out of the grid-striped K2 stages (CTA b runs b, b + BLOCKS,
 # ...). At BLOCKS = 256 every round count is today's value (o_proj 2, down /
-# unpool 1); at BLOCKS = 128 a CTA runs twice the rounds. The phase-2 roles
-# (seam / router / pooler) keep their fixed CTA ranges [0, NA), [R0, R0 +
-# R_TASKS) and [P0, ...); only the pooler, which owns the grid tail [P0, BLOCKS),
-# stripes its P_TASKS over the POOL_CTAS it has (one round when they fit).
-O_ROUNDS = rounds(O_TASKS)  # 2 (256) / 4 (128)
+# unpool 1); a narrower grid or TP4 (which doubles the per-rank task counts)
+# runs more rounds. Phase-2 seam [0, NA) and router [R0, R0 + R_TASKS) keep
+# fixed ranges; the pooler stripes its P_TASKS over the grid tail [POOL_CTA0,
+# BLOCKS). That tail is [P0, BLOCKS) while P0 < BLOCKS (TP8); at TP4/128 the
+# router fills the grid (P0 == BLOCKS), so the pooler falls back to the whole
+# grid [0, BLOCKS) and runs after the seam / router blocks on shared CTAs.
+O_ROUNDS = rounds(O_TASKS)  # 2 (256) / 4 (128) / 4 (TP4 128)
 DOWN_ROUNDS = rounds(DOWN_TASKS)  # 1 (256) / 2 (128)
-U_ROUNDS = rounds(U_TASKS)  # 1 (256) / 2 (128)
-POOL_CTAS = BLOCKS - P0  # pooler CTAs: 160 (256) / 32 (128)
-P_ROUNDS = rounds(P_TASKS, POOL_CTAS)  # 1 (256) / 4 (128)
+U_ROUNDS = rounds(U_TASKS)  # 1 (256) / 2 (TP8 128) / 4 (TP4 128)
+POOL_CTA0 = P0 if P0 < BLOCKS else 0  # pooler tail start (0 when router fills grid)
+POOL_CTAS = BLOCKS - POOL_CTA0  # pooler CTAs: 160 (256) / 32 (128) / 128 (TP4 128)
+P_ROUNDS = rounds(P_TASKS, POOL_CTAS)  # 1 (256) / 4 (128) / 2 (TP4 128)
 
 
 def ug_cta0(s: int) -> int:
@@ -346,10 +349,12 @@ def _validate_k2_placement(blocks: int) -> None:
     import, so a narrower grid (MI350P's 128) is proven before any kernel builds.
     The split-KV core and K1 GEMV placement are validated separately (they need
     their own width rework; windowed split overflows a 128-wide grid)."""
-    pool_ctas = blocks - P0
-    # phase-2 roles seam [0, NA), router [R0, R0 + R_TASKS), pooler [P0, blocks)
-    # are disjoint and within the grid
-    assert NA <= R0 and R0 + R_TASKS <= P0 and blocks > P0, blocks
+    # phase-2 seam [0, NA) and router [R0, R0 + R_TASKS) fit (both run once); the
+    # router sits right after the seam and must fit the grid (it does at TP4/128
+    # exactly: [64, 128)).
+    assert NA <= R0 and blocks >= R0 + R_TASKS, blocks
+    pool_cta0 = P0 if blocks > P0 else 0  # pooler tail start
+    pool_ctas = blocks - pool_cta0
     assert blocks >= G_TASKS and pool_ctas > 0, blocks
     # grid-striped stages (CTA b: b, b + blocks, ...) tile their tasks exactly
     assert O_TASKS % blocks == 0 and DOWN_TASKS % blocks == 0, blocks

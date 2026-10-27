@@ -102,9 +102,9 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     G_TASKS,
     NA,
     O_ROUNDS,
-    P0,
     P_ROUNDS,
     P_TASKS,
+    POOL_CTA0,
     POOL_CTAS,
     R0,
     R_TASKS,
@@ -229,13 +229,14 @@ def program(c, core: str = "tensor") -> None:
     if (b >= R0) & (b < R0 + R_TASKS):
         rops = router.router_loads(c, b - R0)
         router.stage_router(c, b - R0, rops)
-    # the pooler owns the grid tail [P0, BLOCKS): CTA b takes tasks b - P0,
-    # + POOL_CTAS, ... (P_ROUNDS of them, striding by the tail width). One round
-    # at 256 (b - P0 < P_TASKS reproduces the old [P0, P0 + P_TASKS) range), four
-    # at 128 where the tail is only POOL_CTAS = 32 wide.
-    if b >= P0:
+    # the pooler stripes P_TASKS over the grid tail [POOL_CTA0, BLOCKS): CTA b
+    # takes tasks b - POOL_CTA0, + POOL_CTAS, ... (P_ROUNDS of them). One round
+    # at 256 (reproduces the old [P0, P0 + P_TASKS) range); four at TP8/128; at
+    # TP4/128 POOL_CTA0 = 0 (the router fills the grid) so every CTA runs two
+    # pooler tasks after its seam / router role.
+    if b >= POOL_CTA0:
         for r in range_constexpr(P_ROUNDS):
-            t = b - P0 + r * POOL_CTAS
+            t = b - POOL_CTA0 + r * POOL_CTAS
             if t < P_TASKS:
                 pops = pool.pool_loads(c, t)
                 pool.stage_pool(c, t, pops)
