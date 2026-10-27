@@ -598,6 +598,10 @@ def _check_step(runner, w, core, stream, pad, stream_out, branch_out, case) -> d
         big = ref_s.abs() >= 1e-3 * mag
         assert (u[big[live]] <= 1).all(), case
         assert (rb["xrow"][p].float() == 0).all()
+        # ---- isolate the pooler (its output feeds the experts)
+        pool_ref = _linear(rb["xrow"].to(dev), w["w_pool"]).cpu()
+        _pcos = ref.cos(rb["pool"][live], pool_ref[live])
+        assert _pcos > COS_STAGE, (case, "pool cos", float(_pcos))
         # chain guard: against the stock all-reduce's boundary
         _, stream_stock = _stock_boundary(attn_stock, stream, w)
         assert ref.cos(got_s[live], stream_stock.cpu()[live]) > COS_STAGE
@@ -849,7 +853,7 @@ def _k2_worker(
 @needs_gfx950
 @multi_gpu_test(num_gpus=8)
 def test_k2_tp8_matches_vllm_ops_and_replays(monkeypatch: pytest.MonkeyPatch) -> None:
-    multi_process_parallel(monkeypatch, 8, 1, _k2_worker)
+    multi_process_parallel(monkeypatch, spec.TP, 1, _k2_worker)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
