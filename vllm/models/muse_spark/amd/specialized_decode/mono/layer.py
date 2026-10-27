@@ -183,8 +183,14 @@ def split_roles(c) -> None:
             split.stage_split(c, b)
     else:  # every CTA holds a unit
         split.stage_split(c, b)
-    if b >= c0:
-        combine.stage_combine(c, fx.Int32(b) - c0)
+    # combine task k = (b - c0) + r * BLOCKS, for ncomb_rounds passes (1 at TP8:
+    # CTAs [c0, BLOCKS) run one each; 2 at TP4 where HEADS*S combine tasks
+    # overflow the grid, c0 = 0 and every CTA runs two).
+    nc = key.n_comb()
+    for r in range_constexpr(key.ncomb_rounds()):
+        k = (fx.Int32(b) - c0) + r * BLOCKS
+        if (b >= c0) & (k < nc):
+            combine.stage_combine(c, k)
 
 
 @traced

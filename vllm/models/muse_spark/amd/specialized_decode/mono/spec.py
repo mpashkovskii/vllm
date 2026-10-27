@@ -276,19 +276,30 @@ def n_comb(S: int) -> int:
     return HEADS * S
 
 
+def ncomb_rounds(S: int, blocks: int = BLOCKS) -> int:
+    """Combine passes a CTA: 1 while n_comb <= blocks (TP8), 2 at TP4 where the
+    HEADS * S combine tasks (HEADS 32) overflow a 128-wide grid."""
+    return cdiv(n_comb(S), blocks)
+
+
 def C0(S: int, blocks: int = BLOCKS) -> int:
-    """The first combine CTA: [C0, blocks) runs one (token, q head) each."""
-    return blocks - n_comb(S)
+    """The first combine CTA. When the n_comb combine tasks fit the grid they sit
+    at the top [C0, blocks), one (token, q head) each (C0 = blocks - n_comb, the
+    split units get the low CTAs). When they overflow (TP4) C0 is 0: every CTA
+    runs ``ncomb_rounds`` tasks b - C0, + blocks, ... (< n_comb)."""
+    return max(0, blocks - n_comb(S))
 
 
 def _validate_split_placement(blocks: int) -> None:
     """The split-KV core placement fits a ``blocks``-wide grid at every width S:
-    the split units [0, n_units) and the combine CTAs [C0, blocks) both fit, and
-    a unit has at least one page part. The two ranges may overlap (they already
-    do at 256, S = 8); a CTA holding both runs its unit first, so overlap needs
-    no separation -- only C0 >= 0 (n_comb <= blocks)."""
+    the split units [0, n_units) fit in one pass, and the n_comb combine tasks
+    are covered by ``ncomb_rounds`` grid-striped passes from C0. The split and
+    combine ranges may overlap (they already do at 256, S = 8); a CTA holding
+    both runs its unit first, so overlap needs no separation."""
     for s in range(1, MAX_ROWS + 1):
-        assert n_comb(s) <= blocks, (blocks, s)  # C0 >= 0
+        c0 = C0(s, blocks)
+        assert 0 <= c0 < blocks, (blocks, s)
+        assert ncomb_rounds(s, blocks) * blocks - c0 >= n_comb(s), (blocks, s)
         for w in (False, True):
             assert nsplit(s, w, blocks) >= 1, (blocks, s, w)
             assert n_units(s, w, blocks) <= blocks, (blocks, s, w)
@@ -452,6 +463,14 @@ class K2Build:
     def c0(self) -> int:
         """A split build's first combine CTA."""
         return C0(self.tokens)
+
+    def n_comb(self) -> int:
+        """A split build's combine tasks (one a (token, q head))."""
+        return n_comb(self.tokens)
+
+    def ncomb_rounds(self) -> int:
+        """Combine passes a CTA (1 at TP8, 2 at TP4)."""
+        return ncomb_rounds(self.tokens)
 
     def kernel_name(self) -> str:
         """The kernel symbol: one per build. A Phase A build ("tensor") keeps
