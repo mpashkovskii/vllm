@@ -606,4 +606,5 @@ def _chain_worker(
 @needs_gfx950
 @multi_gpu_test(num_gpus=8)
 def test_layer_chain(monkeypatch: pytest.MonkeyPatch) -> None:
-    multi_process_parallel(monkeypatch, 8, 1, _chain_worker)
+    # tp_size from spec.TP (VLLM_MUSE_SPARK_TP): 8 by default, 4 for TP4
+    multi_process_parallel(monkeypatch, spec.TP, 1, _chain_worker)

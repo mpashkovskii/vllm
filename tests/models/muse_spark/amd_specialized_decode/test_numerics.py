@@ -106,11 +106,15 @@ def _tag(runner) -> int:
 
 
 def _owner_sum(part: torch.Tensor) -> torch.Tensor:
-    """A rank's 32 owner slices [..., 32] summed in ``stage_owner``'s fp32
-    order: lane rp the 4 slices 4 rp .. in order, then the butterfly over the
-    8 lanes (xor 4, 2, 1), which every lane ends with (lane 0's order)."""
-    lane = part[..., 0::4] + part[..., 1::4]
-    lane = (lane + part[..., 2::4]) + part[..., 3::4]  # [..., 8]: lane rp
+    """A rank's RED_TASKS owner slices [..., RED_TASKS] summed in
+    ``stage_owner``'s fp32 order: lane rp the PSS_PER_LANE contiguous slices
+    PSS_PER_LANE rp .. in order (left fold), then the butterfly over the 8 lanes
+    (xor 4, 2, 1), which every lane ends with (lane 0's order). PSS_PER_LANE is
+    4 at TP8, 8 at TP4."""
+    ppl = spec.RED_TASKS // (spec.ROWS // 2)  # PSS_PER_LANE
+    lane = part[..., 0::ppl]
+    for q in range(1, ppl):
+        lane = lane + part[..., q::ppl]  # [..., 8]: lane rp's PSS_PER_LANE slices
     for off in (4, 2, 1):
         lane = lane + lane[..., [rp ^ off for rp in range(8)]]
     return lane[..., 0]
