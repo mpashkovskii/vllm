@@ -20,17 +20,29 @@ from dataclasses import dataclass
 # --------------------------------------------------------------------------
 # The model (Muse Spark Open at TP8)
 
+# Tensor-parallel degree. TP8 is the model's native shard (MI355X); TP4 (for a
+# 4-GPU TP island under PP) doubles every per-rank count below. SUPPORTED_TP is
+# the set the shapes and placement are validated for. Like BLOCKS this is a
+# per-deployment constant; the runtime picks it from tensor_parallel_size.
+SUPPORTED_TP = (8, 4)
 TP = 8
+assert TP in SUPPORTED_TP
 HIDDEN = 8192  # H: the residual stream
 MOE_HIDDEN = 4096  # the pooled width the routed experts see
-INTER = 512  # an expert's intermediate a rank (moe_intermediate_size / TP)
 EXPERTS = 256
 TOPK = 8
-EXPERTS_RANK = EXPERTS // TP  # 32 router rows a rank
-HEADS = 16  # query heads a rank (128 / TP)
-KV_HEADS = 2  # KV heads a rank (16 / TP)
 HEAD_DIM = 64
-CORE = HEADS * HEAD_DIM  # 1024: o_proj's K a rank
+# The model's full (pre-shard) counts; the per-rank shapes are these // TP.
+N_HEADS = 128  # num_attention_heads
+N_KV_HEADS = 16  # num_key_value_heads
+MOE_INTER = 4096  # moe_intermediate_size
+assert N_HEADS % TP == 0 and N_KV_HEADS % TP == 0 and MOE_INTER % TP == 0
+assert EXPERTS % TP == 0
+INTER = MOE_INTER // TP  # 512 (TP8) / 1024 (TP4): an expert's intermediate a rank
+EXPERTS_RANK = EXPERTS // TP  # 32 (TP8) / 64 (TP4) router rows a rank
+HEADS = N_HEADS // TP  # 16 (TP8) / 32 (TP4) query heads a rank
+KV_HEADS = N_KV_HEADS // TP  # 2 (TP8) / 4 (TP4) KV heads a rank
+CORE = HEADS * HEAD_DIM  # 1024 (TP8) / 2048 (TP4): o_proj's K a rank
 
 # runtime.text_shapes(text_config) must equal MUSE_SHAPES, field by field.
 MUSE_SHAPE_FIELDS = (
