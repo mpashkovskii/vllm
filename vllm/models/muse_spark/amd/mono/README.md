@@ -17,9 +17,10 @@ cover run vLLM's stock path.
   no PP / DP / DCP / PCP, Quark OCP-MXFP4 W4A4 experts on `AITER_MXFP4_MXFP4`
   (shuffled weights and scales), the fused QK-norm / RoPE / KV insert,
   `ROCM_AITER_FA` with a bf16 or fp8 (`--kv-cache-dtype fp8` / `fp8_e4m3`)
-  KV cache in the LBHNC layout (block size 16),
-  DSpark with 7 draft tokens, no LoRA, sleep mode or weight transfer, no KV
-  connector or offloading.
+  KV cache in the LBHNC layout (block size 16, or 32: see KV below),
+  speculative decoding with 7 draft tokens (DSpark, or DFlash2 such as
+  `RadixArk/Muse-Spark-Open-DFlash2`), no LoRA, sleep mode or weight
+  transfer, no KV connector or offloading.
 - Steps (checked every forward; anything else runs stock): uniform decode
   verify batches of 1-16 requests x 8 tokens, FULL CUDA graph or eager. TP 4
   has the K3 builds and the 32-row HA + HM + HB build (1-4 requests, no fused
@@ -82,9 +83,15 @@ op. 40-128 rows keep vLLM's op.
   `[32 r, 32 r + 32)`), `pooler` / `unpooler` row slices, the experts after
   `shuffle_weight(layout=(16, 16))` and the scales after `e8m0_shuffle`. The
   norm multipliers are small bf16 copies (`weight + gain_center`).
-- KV: layer i+1's `kv_cache` `[block][kv head][16 tokens][K 64 | V 64]` bf16
+- KV: layer i+1's `kv_cache` `[block][kv head][B tokens][K 64 | V 64]` bf16
   and its group's `slot_mapping` (`slot < 0` = graph padding, skipped); the
-  block stride is a launch argument.
+  block stride is a launch argument. B is 16, or 32 when vLLM doubles the
+  target's block to give every KV cache group one page size (a DFlash2 draft
+  needs a bf16 KV cache, `"kv_cache_dtype": "auto"` in the speculative
+  config, next to an fp8 target cache). K3 and HB take B as a build key and
+  build for the block of the first eligible step; the fused attention (TP 8
+  on 256 CTAs) reads 16-token blocks, so with a 32-token cache the steps of
+  a build that has it run stock.
 - fp8 KV (e4m3): the insert stores `bf16(x) / k_scale` (or `v_scale`)
   saturated to +-448 and rounded to nearest even, as vLLM's fused insert. The
   fused attention widens e4m3 to bf16 (exact), multiplies the softmax scale

@@ -44,7 +44,7 @@ MAX_ROWS = {4: 32, 8: K5_ROWS[-1]}
 # is the device's CU count. The kernels lay their work out for 256 CTAs; on 128 CUs
 # (MI350P) each CTA runs two of them in turn. CU count -> the TP sizes built for it.
 GRID_WORLD_SIZES = {256: (4, 8), 128: (4,)}
-KV_BLOCK_SIZE = 16
+KV_BLOCK_SIZES = (16, 32)  # tokens a KV cache block the KV insert supports
 HEALTH_POLL_INTERVAL = 64
 # Attention types whose verify attention runs inside the launch, per build.
 # Other builds and layer 1 run vLLM's attention op.
@@ -396,17 +396,23 @@ def layer_refusals(model: nn.Module, dims: MonoDims) -> list[str]:
 
 
 def kv_cache_refusal(kv_cache: torch.Tensor, kv_heads: int, kv_fp8: bool) -> str | None:
-    """K3 writes LBHNC pages `[block][kv head][16 tokens][K | V]`: bf16, or
-    e4m3 (uint8 storage) with `kv_fp8`."""
+    """K3 / HB write LBHNC pages `[block][kv head][16 or 32 tokens][K | V]`:
+    bf16, or e4m3 (uint8 storage) with `kv_fp8`. 32-token blocks come from
+    a draft KV cache of another dtype (vLLM gives every KV cache group the
+    same page size: a bf16 draft doubles an fp8 target's block)."""
     if kv_cache.numel() == 0:
         return "kv:unbound"
     dtypes = (torch.uint8, torch.float8_e4m3fn) if kv_fp8 else (torch.bfloat16,)
     if kv_cache.dtype not in dtypes:
         return f"kv:{kv_cache.dtype}"
-    want_shape = (kv_heads, KV_BLOCK_SIZE, 2 * 64)
-    if tuple(kv_cache.shape[1:]) != want_shape:
+    block = kv_cache.shape[2] if kv_cache.dim() == 4 else 0
+    if block not in KV_BLOCK_SIZES or tuple(kv_cache.shape[1:]) != (
+        kv_heads,
+        block,
+        2 * 64,
+    ):
         return f"kv:shape{tuple(kv_cache.shape)}"
-    if tuple(kv_cache.stride()[1:]) != (KV_BLOCK_SIZE * 128, 128, 1):
+    if tuple(kv_cache.stride()[1:]) != (block * 128, 128, 1):
         return f"kv:stride{tuple(kv_cache.stride())}"
     return None
 
@@ -673,7 +679,7 @@ class _K3Bucket(_Bucket):
         w = dims.world_size
         super().__init__(k3, k3.peer_layout(rows, w)[1], dims, device, group)
 
-        def build(next_rope: bool, attn: str = ""):
+        def build(next_rope: bool, attn: str = "", kv_block: int = 16):
             return k3.build(
                 k3.build_vllm(
                     S=rows,
@@ -682,10 +688,15 @@ class _K3Bucket(_Bucket):
                     attn=attn,
                     kv_fp8=kv_fp8,
                     grid=grid,
+                    kv_block=kv_block,
                 )
             )
 
-        self.launchers = {next_rope: build(next_rope) for next_rope in (True, False)}
+        self._build = build
+        # (next_rope, KV block) -> launch; a 32-token block's builds on first use
+        self.launchers = {
+            (next_rope, 16): build(next_rope) for next_rope in (True, False)
+        }
         self.fa = fa
         self.fused_launchers = {
             (next_rope, kind): build(next_rope, kind) for next_rope, kind in fused_kinds
@@ -710,11 +721,13 @@ class _K3Bucket(_Bucket):
 
     def layer(self, mono, i, kind, attn_o, g, stream, kv, aux_layers):
         a, out = mono.weights[i], self.outs[i % 2]
-        launch = (
-            self.launchers[a.next_rope]
-            if kind is None
-            else self.fused_launchers[(a.next_rope, kind)]
-        )
+        if kind is None:
+            lk = (a.next_rope, mono.kv_block)
+            if lk not in self.launchers:
+                self.launchers[lk] = self._build(a.next_rope, kv_block=mono.kv_block)
+            launch = self.launchers[lk]
+        else:
+            launch = self.fused_launchers[(a.next_rope, kind)]
         launch(
             attn_o,
             g.data_ptr(),
@@ -762,10 +775,12 @@ class _K5Bucket(_Bucket):
         key = k5.build_vllm(S=rows, W=w, next_rope=True, kv_fp8=kv_fp8, grid=grid)
         super().__init__(k5, k5.peer_layout(rows, w, key.bnd)[1], dims, device, group)
         self.bnd = key.bnd
+        self.key, self.k5 = key, k5
         self.launch_a, launch_b = k5.build(key)
+        # (next_rope, KV block) -> HB (HB inserts the KV); 32-token builds on first use
         self.launch_b = {
-            True: launch_b,
-            False: k5.build(dataclasses.replace(key, next_rope=False))[1],
+            (True, 16): launch_b,
+            (False, 16): k5.build(dataclasses.replace(key, next_rope=False))[1],
         }
         self.launch_m = k5m.build(k5m.build_vllm(S=rows, W=w, grid=grid))
         self.fa = fa
@@ -840,7 +855,14 @@ class _K5Bucket(_Bucket):
         )
         gather = int(i == LAST_LAYER or i + 1 in aux_layers or self.bnd == 1)
         ts, q_out, g_out = self.ts[i % 2], self.q[i % 2], self.g[i % 2]
-        self.launch_b[a.next_rope](
+        lk = (a.next_rope, mono.kv_block)
+        if lk not in self.launch_b:
+            self.launch_b[lk] = self.k5.build(
+                dataclasses.replace(
+                    self.key, next_rope=a.next_rope, kv_block=mono.kv_block
+                )
+            )[1]
+        self.launch_b[lk](
             self.part.data_ptr(),
             *a.hb,
             ts.data_ptr(),
@@ -894,6 +916,7 @@ class MuseSparkMono:
         self.rank = rank
         self.dims = dims
         self.kv_fp8 = kv_fp8
+        self.kv_block = 16  # tokens a KV cache block of the current step (16 / 32)
         self.grid = grid
         self.refresh_weights(model)
         self.buckets: dict[int, _Bucket] = {}
@@ -960,11 +983,13 @@ class MuseSparkMono:
             return f"rows:{rows}"
         if positions.dtype != torch.int64 or positions.shape != (rows,):
             return "positions"
+        blocks = set()
         for name in names[1:]:
             _, _, kv_cache, slots = get_attention_context(name)
             reason = kv_cache_refusal(kv_cache, self.dims.local_kv_heads, self.kv_fp8)
             if reason is not None:
                 return reason
+            blocks.add(kv_cache.shape[2])
             if (
                 slots is None
                 or slots.dtype != torch.int64
@@ -972,6 +997,12 @@ class MuseSparkMono:
                 or slots.stride(-1) != 1
             ):
                 return "slot-mapping"
+        if len(blocks) != 1:
+            return f"kv:blocks{sorted(blocks)}"
+        block = blocks.pop()
+        if block != 16 and self.buckets[bucket_of(rows)].fa is not None:
+            return f"kv:block{block}-fused"  # the fused attention reads 16-token blocks
+        self.kv_block = block
         return None
 
     def try_forward(
@@ -994,7 +1025,11 @@ class MuseSparkMono:
             self._engaged.add(n)
             kernel = "K3" if rows in K3_ROWS else "HA+HM+HB"
             logger.info(
-                "Muse Spark monokernel engaged: %d rows, %s S=%d", n, kernel, rows
+                "Muse Spark monokernel engaged: %d rows, %s S=%d, KV block %d",
+                n,
+                kernel,
+                rows,
+                self.kv_block,
             )
         layers, aux_layers = model.layers, model.aux_hidden_state_layers
         bucket = self.buckets[rows]
