@@ -86,9 +86,11 @@ op. 40-128 rows keep vLLM's op.
 - KV: layer i+1's `kv_cache` `[block][kv head][B tokens][K 64 | V 64]` bf16
   and its group's `slot_mapping` (`slot < 0` = graph padding, skipped); the
   block stride is a launch argument. B is 16, or 32 when vLLM doubles the
-  target's block to give every KV cache group one page size (a DFlash2 draft
-  needs a bf16 KV cache, `"kv_cache_dtype": "auto"` in the speculative
-  config, next to an fp8 target cache). K3 and HB take B as a build key and
+  target's block to give every KV cache group one page size: a bf16 draft
+  KV cache next to an fp8 target cache, as a DFlash2 draft with
+  `ROCM_AITER_FA` attention needs (`"kv_cache_dtype": "auto"` in the
+  speculative config). A DFlash2 draft on `TRITON_ATTN` keeps an fp8 cache
+  and the target's 16-token block. K3 and HB take B as a build key and
   build for the block of the first eligible step; the fused attention (TP 8
   on 256 CTAs) reads 16-token blocks, so with a 32-token cache the steps of
   a build that has it run stock.
