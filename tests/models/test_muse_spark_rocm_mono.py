@@ -296,8 +296,11 @@ def test_kv_cache_guard_accepts_only_dense_lbhnc_of_the_configured_dtype() -> No
         assert kv_cache_refusal(fp8, 2, kv_fp8=False) == f"kv:{dtype}"
     e5m2 = torch.empty(10, 2, 16, 128, dtype=torch.float8_e5m2, device="meta")
     assert kv_cache_refusal(e5m2, 2, kv_fp8=True) == "kv:torch.float8_e5m2"
+    # 32-token blocks: a draft KV cache of another dtype doubles the block.
     block32 = torch.empty(10, 2, 32, 128, dtype=torch.bfloat16, device="meta")
-    assert kv_cache_refusal(block32, 2, False).startswith("kv:shape")
+    assert kv_cache_refusal(block32, 2, False) is None
+    block64 = torch.empty(10, 2, 64, 128, dtype=torch.bfloat16, device="meta")
+    assert kv_cache_refusal(block64, 2, False).startswith("kv:shape")
     unbound = torch.empty(0, dtype=torch.bfloat16)
     assert kv_cache_refusal(unbound, 2, False) == "kv:unbound"
 
@@ -662,6 +665,7 @@ class _Key:
     bnd: int = 0
     kv_fp8: bool = False
     grid: int = 256
+    kv_block: int = 16
 
 
 class _Kernel:
@@ -680,9 +684,11 @@ class _Kernel:
     def scratch_layout(self, S, W=1, bnd=0):
         return {}, 4096
 
-    def build_vllm(self, S, W, next_rope=True, attn="", kv_fp8=False, grid=256):
+    def build_vllm(
+        self, S, W, next_rope=True, attn="", kv_fp8=False, grid=256, kv_block=16
+    ):
         bnd = self.owner.bnd if self.name == "k5" else 0
-        return _Key(S, W, next_rope, attn, bnd, kv_fp8, grid)
+        return _Key(S, W, next_rope, attn, bnd, kv_fp8, grid, kv_block)
 
     def build(self, key: _Key):
         o = self.owner
@@ -734,11 +740,19 @@ class _AttnFrag:
         ]
 
 
+def _assert_kv_block(o: StockLaunches, key: _Key, layer: int) -> None:
+    """The build inserts into the next layer's KV cache: its block size."""
+    _, _, kv_cache, _ = _attention_context(o.model.layers[layer + 1])
+    assert key.kv_block == kv_cache.shape[2], (key.kv_block, kv_cache.shape)
+
+
 def _run_k3(o: StockLaunches, key: _Key, a: dict) -> None:
+    _assert_kv_block(o, key, a["layer"])
     o.run_layer(key.S, a | {"stream": a["stream_pre"], "fused": bool(key.attn)}, a)
 
 
 def _run_hb(o: StockLaunches, key: _Key, b: dict) -> None:
+    _assert_kv_block(o, key, b["layer"])
     a = o.pending.pop(b["layer"])
     assert a["nrows"] == b["nrows"]
     o.run_layer(b["nrows"], a | {"stream": a["stream_in"]}, b)
@@ -751,7 +765,9 @@ def _attention_context(layer):
 class Step:
     """One verify step's real attention metadata and KV caches."""
 
-    def __init__(self, tiny: TinyModel, query_lens: list[int], seed: int) -> None:
+    def __init__(
+        self, tiny: TinyModel, query_lens: list[int], seed: int, kv_block: int = 16
+    ) -> None:
         from tests.v1.attention.utils import (
             BatchSpec,
             create_common_attn_metadata,
@@ -767,7 +783,7 @@ class Step:
         ]
         self.common = create_common_attn_metadata(
             BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
-            16,
+            kv_block,
             device,
             arange_block_indices=True,
         )
@@ -777,6 +793,7 @@ class Step:
         self.metadata: dict[str, Any] = {}
         self.kv_caches: dict[str, torch.Tensor] = {}
         for kind, spec in tiny.kv_specs.items():
+            spec = dataclasses.replace(spec, block_size=kv_block)
             names = [
                 n
                 for n, layer in zip(self.names, tiny.layers)
@@ -918,6 +935,32 @@ def test_mono_step_on_a_128_cta_grid(tiny_model, num_reqs, bnd) -> None:
     assert launches.built
     assert {key.grid for _, key in launches.built} == {128}
     assert not any(key.attn for _, key in launches.built)
+    assert {name for name, _ in launches.calls} == (
+        {"k3"} if num_reqs <= 2 else {"ha", "hm", "hb"}
+    )
+    _assert_same_step(stock, mono)
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    ("num_reqs", "bnd", "aux_layers"),
+    # aux ids of Muse-Spark-Open-DFlash2 (target_layer_ids 1, 16, 30, 44, 59)
+    [
+        (1, 0, (2, 17, 31, 45, 60)),
+        (2, 0, (2, 17, 31, 45, 60)),
+        (4, 3, (2, 17, 31, 45, 60)),
+    ],
+)
+def test_mono_step_on_32_token_kv_blocks(tiny_model, num_reqs, bnd, aux_layers) -> None:
+    """A bf16 draft KV cache next to an fp8 target one gives the target
+    32-token blocks: K3 and HB are built for them on the first such step
+    (each launch's build matches the next layer's KV block) and the step is
+    the stock one."""
+    tiny_model.lm.set_aux_hidden_state_layers(aux_layers)
+    step = Step(tiny_model, [ROWS_PER_REQUEST] * num_reqs, seed=num_reqs, kv_block=32)
+    stock = step.run(tiny_model)
+    launches, mono = _run_mono(tiny_model, step, bnd, [8, 16, 32], grid=128)
+    assert any(key.kv_block == 32 for _, key in launches.built)
     assert {name for name, _ in launches.calls} == (
         {"k3"} if num_reqs <= 2 else {"ha", "hm", "hb"}
     )

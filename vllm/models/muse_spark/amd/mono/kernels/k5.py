@@ -193,6 +193,9 @@ REGION_IDS = {
 }
 
 
+KV_BLOCKS = (16, 32)  # tokens a KV cache block the insert supports
+
+
 @dataclass(frozen=True)
 class Build:
     S: int = 32  # rows (32 / 64 / 96 / 128)
@@ -201,6 +204,7 @@ class Build:
     # this layer's verify attention fused at the HA head ("swa" / "full")
     attn: str = ""
     kv_fp8: bool = False  # e4m3 KV cache (HB insert, HA fused attention); else bf16
+    kv_block: int = 16  # tokens a KV cache block (16 or 32; fused attention: 16)
     # physical CTAs (256: one a CU of an MI355X; 128: an MI350P, S = 32 only): each runs
     # BLOCKS / grid virtual CTAs bid + grid v of the BLOCKS-CTA layout, stage by stage
     grid: int = BLOCKS
@@ -310,6 +314,8 @@ def build(key: Build):
     OK_K, NQTILES, NQT = d.OK_K, d.NQTILES, d.NQT
     assert W == 8 or S == 32, (S, W)
     GRID = key.grid
+    KVB = key.kv_block  # tokens a KV cache block
+    KVB_SHIFT = KVB.bit_length() - 1
     # peer stores: device scope + release fences on PCIe (128 CTAs), else as before
     mb_put_sys, peer_release, CM_PEER = peer_ops(GRID < BLOCKS)
     assert GRID in GRIDS, GRID
@@ -402,7 +408,11 @@ def build(key: Build):
 
     gsuf = f"_g{GRID}" if V > 1 else ""
     name_a = f"muse_k5a_s{S}_w{W}" + (f"_fa{key.attn}" if key.attn else "") + gsuf
-    name_b = f"muse_k5b_s{S}_w{W}_r{int(key.next_rope)}" + gsuf
+    name_b = (
+        f"muse_k5b_s{S}_w{W}_r{int(key.next_rope)}"
+        + gsuf
+        + (f"_b{KVB}" if KVB != 16 else "")
+    )
 
     # ------------------------------------------------------------ shared helpers
     def red_at(red, base_tile, rr, tt):
@@ -1995,7 +2005,7 @@ def build(key: Build):
         """The finish of head hh (uniform), token tt (lanes 0-31 / 32-63 of a wave: two tokens): q / k as
         vLLM's fused_muse_spark_qknorm_rope_kv_insert (weightless qk-norm, GPT-J RoPE with fp32 cos / sin,
         all fp32, one RNE bf16 rounding; no qk_scale); K / V as one bf16 dword a lane into the LBHNC cache,
-        element (slot >> 4) * bstride + (kv * 16 + (slot & 15)) * 128 + 64 isv + 2p, bstride = v_cache (a
+        element (slot // B) * bstride + (kv * B + slot % B) * 128 + 64 isv + 2p, B = key.kv_block, bstride = v_cache (a
         value); each half wave stores with its own wave-uniform 64-bit block base (readlane of its slot);
         slot < 0 and tt >= nrows skipped. Rows tt >= nrows are not real rows (their q is written, their KV
         is not). kv_fp8: e4m3 bytes (element = byte) scaled by 1 / *k_scale or *v_scale, one dword a lane
@@ -2037,8 +2047,8 @@ def build(key: Build):
                 tl_ = readlane(tt, 32 * half)
                 mine = ((tid % 64) >= 32) if half == 1 else ((tid % 64) < 32)
                 if (sl >= 0) & (tl_ < nrows):
-                    eoff = fx.Int64(sl >> 4) * v_cache + fx.Int64(
-                        (kv * 16 + (sl & 15)) * 128
+                    eoff = fx.Int64(sl >> KVB_SHIFT) * v_cache + fx.Int64(
+                        (kv * KVB + (sl & (KVB - 1))) * 128
                         + isv.select(fx.Int32(HD), fx.Int32(0))
                     )
                     if const_expr(key.kv_fp8):
@@ -2587,19 +2597,24 @@ def build(key: Build):
     return _BUILDS[key]
 
 
-def build_vllm(S=32, W=8, next_rope=True, attn="", kv_fp8=False, grid=BLOCKS):
+def build_vllm(
+    S=32, W=8, next_rope=True, attn="", kv_fp8=False, grid=BLOCKS, kv_block=16
+):
     """The HA / HB build vLLM launches for S rows (32 / 64 / 96 / 128) of a TP = EP = W group
     (W = 4: S = 32 only); next_rope: the next layer has RoPE (HB); attn = "swa" / "full": this
     layer's verify attention fused at the HA head (W = 8 only); kv_fp8: e4m3 KV cache; grid:
-    the CTAs a launch (256 on an MI355X; 128 on an MI350P: S = 32, no fused attention)."""
+    the CTAs a launch (256 on an MI355X; 128 on an MI350P: S = 32, no fused attention);
+    kv_block: tokens a KV cache block (16 / 32; the fused attention reads 16)."""
     assert W in (4, 8) and S in (32, 64, 96, 128) and grid in GRIDS, (S, W, grid)
     assert (W == 8 or S == 32) and (not attn or W == 8), (S, W, attn)
     assert grid == BLOCKS or (S == 32 and not attn), (S, attn, grid)
+    assert kv_block in KV_BLOCKS and (not attn or kv_block == 16), (kv_block, attn)
     return Build(
         S=S,
         W=W,
         next_rope=bool(next_rope),
         attn=attn,
         kv_fp8=bool(kv_fp8),
+        kv_block=kv_block,
         grid=grid,
     )

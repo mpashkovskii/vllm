@@ -452,6 +452,9 @@ REGION_IDS.update(
 )
 
 
+KV_BLOCKS = (16, 32)  # tokens a KV cache block the insert supports
+
+
 @dataclass(frozen=True)
 class Build:
     S: int = 8  # rows (8 or 16)
@@ -459,6 +462,7 @@ class Build:
     next_rope: bool = True  # the next layer has RoPE (SWA) or not (full, NoPE)
     attn: str = ""  # this layer's verify attention fused at the head ("swa" / "full"); "" = run before the launch
     kv_fp8: bool = False  # e4m3 KV cache (insert and fused attention); else bf16
+    kv_block: int = 16  # tokens a KV cache block (16 or 32; fused attention: 16)
     # physical CTAs (256: one a CU of an MI355X; 128: an MI350P): each runs
     # BLOCKS / grid virtual CTAs bid + grid v of the BLOCKS-CTA layout, stage by stage
     grid: int = BLOCKS
@@ -547,6 +551,8 @@ def build(key: Build):
     assert S in (8, 16), S
     d = _DIMS[key.W]
     GRID = key.grid
+    KVB = key.kv_block  # tokens a KV cache block
+    KVB_SHIFT = KVB.bit_length() - 1
     # peer stores: device scope + release fences on PCIe (128 CTAs), else as before
     mb_put_sys, peer_release, CM_PEER = peer_ops(GRID < BLOCKS)
     assert GRID in GRIDS, GRID
@@ -689,6 +695,7 @@ def build(key: Build):
         f"muse_k3_s{S}_w{W}_r{int(key.next_rope)}"
         + (f"_fa{key.attn}" if key.attn else "")
         + (f"_g{GRID}" if V > 1 else "")
+        + (f"_b{KVB}" if KVB != 16 else "")
     )
 
     # ------------------------------------------------------------ stage A (sharded)
@@ -2101,7 +2108,7 @@ def build(key: Build):
         q / k as vLLM's fused_muse_spark_qknorm_rope_kv_insert: weightless qk-norm, then GPT-J RoPE in
         fp32 with the fp32 cos / sin, one RNE bf16 rounding (bf16_pair); q without qk_scale. V passes
         through (the bf16 GEMV). K / V pairs go as one bf16 dword into the LBHNC cache, element
-        ((slot >> 4) * bstride + (kv * 16 + (slot & 15)) * 128 + 64 isv + 2p), bstride = v_cache (the
+        ((slot // B) * bstride + (kv * B + slot % B) * 128 + 64 isv + 2p), B = key.kv_block, bstride = v_cache (the
         block stride in elements, a value, not a pointer); slot < 0 (padded rows) skipped. The block
         base is 64-bit and wave-uniform (one buffer resource a wave). kv_fp8: e4m3 bytes (element =
         byte) scaled by 1 / *k_scale or *v_scale, one dword a lane pair (e4m3_dword)."""
@@ -2133,8 +2140,8 @@ def build(key: Build):
             if const_expr(key.kv_fp8):
                 w8 = e4m3_dword(o0, o1, inv_kv_scale(isv.select(v_scale, k_scale)))
             if slot >= 0:
-                eoff = fx.Int64(slot >> 4) * v_cache + fx.Int64(
-                    (kv * 16 + (slot & 15)) * 128
+                eoff = fx.Int64(slot >> KVB_SHIFT) * v_cache + fx.Int64(
+                    (kv * KVB + (slot & (KVB - 1))) * 128
                     + isv.select(fx.Int32(HD), fx.Int32(0))
                 )
                 if const_expr(key.kv_fp8):
@@ -2824,18 +2831,23 @@ def build(key: Build):
     return launch
 
 
-def build_vllm(S=8, W=8, next_rope=True, attn="", kv_fp8=False, grid=BLOCKS):
+def build_vllm(
+    S=8, W=8, next_rope=True, attn="", kv_fp8=False, grid=BLOCKS, kv_block=16
+):
     """The K3 build vLLM launches for S rows (8 / 16) of a TP = EP = W (8 / 4) group;
     next_rope: the next layer has RoPE; attn = "swa" / "full": this layer's verify attention
     fused at the head (W = 8 only); kv_fp8: e4m3 KV cache; grid: the CTAs a launch (one a
-    CU: 256 on an MI355X, 128 on an MI350P)."""
+    CU: 256 on an MI355X, 128 on an MI350P); kv_block: tokens a KV cache block (16 / 32;
+    the fused attention reads 16)."""
     assert W in (4, 8) and S in (8, 16) and grid in GRIDS, (S, W, grid)
     assert not attn or (W == 8 and grid == BLOCKS), (attn, W, grid)
+    assert kv_block in KV_BLOCKS and (not attn or kv_block == 16), (kv_block, attn)
     return Build(
         S=S,
         W=W,
         next_rope=bool(next_rope),
         attn=attn,
         kv_fp8=bool(kv_fp8),
+        kv_block=kv_block,
         grid=grid,
     )
