@@ -20,6 +20,7 @@ meta:
     gb300: verified
     mi350x: verified
     mi355x: verified
+    mi350p: verified
 
 model:
   model_id: "meta-models/Muse-Spark-Open-816B-A42B"
@@ -102,6 +103,7 @@ features:
           b300: supported
           gb300: supported
           mi355x: supported
+          mi350p: supported
         args:
           - "--speculative-config"
           - '{"method":"dspark","model":"Inferact/Muse-Spark-Open-DSpark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
@@ -119,6 +121,35 @@ features:
             env:
               AITER_UNIFIED_ATTN_SHORT_QUERY_3D: "1"
               VLLM_KV_CACHE_LAYOUT: "LBHNC"
+
+      # Validated on MI350P (TP4 + EP4) only. The DFlash2 draft attention is
+      # non-causal, so ROCM_AITER_UNIFIED_ATTN refuses it; TRITON_ATTN keeps an
+      # fp8 draft KV cache (the target's 16-token block) and is the fastest.
+      dflash2:
+        label: "DFlash2"
+        description: "Seven-token DFlash2 draft (RadixArk/Muse-Spark-Open-DFlash2) with fp8 draft weights and KV cache. On MI350P it accepts 5.2 tokens a step on GSM8K, against 3.96 for DSpark."
+        variants: [mxfp4]
+        hardware:
+          default: unsupported
+          mi350p: supported
+        args:
+          - "--speculative-config"
+          - '{"method":"dflash","model":"RadixArk/Muse-Spark-Open-DFlash2","quantization":"fp8","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false,"attention_backend":"TRITON_ATTN"}'
+        env:
+          VLLM_KV_CACHE_LAYOUT: "LBHNC"
+      dflash2_specialized:
+        label: "DFlash2 + specialized decode"
+        description: "DFlash2 with the decode monokernel: verify steps of up to four requests run on fused persistent kernels, other steps on the regular path. Runs TP4 + expert parallel on MI350P (one TP4 engine, or two TP4 replicas behind vllm-router) and needs a vLLM build with vllm-project/vllm#66836."
+        variants: [mxfp4]
+        hardware:
+          default: unsupported
+          mi350p: supported
+        args:
+          - "--speculative-config"
+          - '{"method":"dflash","model":"RadixArk/Muse-Spark-Open-DFlash2","quantization":"fp8","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false,"attention_backend":"TRITON_ATTN"}'
+          - "--monokernel"
+        env:
+          VLLM_KV_CACHE_LAYOUT: "LBHNC"
 
 opt_in_features:
   - spec_decoding
@@ -148,9 +179,15 @@ variants:
     precision: mxfp4
     # Checkpoint total_size 508,864,619,120 bytes, plus 20% serving headroom.
     vram_minimum_gb: 611
-    supported_hardware: [mi350x, mi355x]
+    supported_hardware: [mi350x, mi355x, mi350p]
+    # MI350P (144 GB): the weights take 129.7 GB per GPU at TP4.
+    tp:
+      mi350p: 4
     description: "AMD Quark OCP MXFP4 W4A4 weights for gfx950 on the AITER MXFP4 MoE kernels."
     hardware_overrides:
+      # TP4 on four of the node's MI350P GPUs (see strategy_overrides).
+      mi350p:
+        vram_minimum_gb: 576
       amd:
         extra_args:
           - "--attention-backend"
@@ -172,6 +209,8 @@ variants:
       spec_decoding: dspark
 
 compatible_strategies:
+  # First so it is MI350P's default (gated to MI350P in strategy_hardware).
+  - single_node_tp_replicas
   - single_node_tp
   - single_node_tep
   - single_node_dep
@@ -187,6 +226,15 @@ default_strategy: single_node_tep
 
 # The ROCm MoE path requires DP1 (muse_moe_runner._validate_tp_post_norm_deployment).
 strategy_hardware:
+  # Two TP4 replicas behind vllm-router, the layout validated on 4x MI350P.
+  single_node_tp_replicas:
+    default: unsupported
+    mi350p: supported
+  # On MI350P the TEP strategy renders TP8 across all eight PCIe GPUs: the
+  # decode monokernel runs TP4 only on 128-CU GPUs, and the validated layout
+  # is TP4 + expert parallel, rendered through single_node_tp below.
+  single_node_tep:
+    mi350p: unsupported
   single_node_dep:
     amd: unsupported
   multi_node_dep:
@@ -209,6 +257,30 @@ hardware_overrides:
       VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: "bf16"
       VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
 strategy_overrides:
+  single_node_tp:
+    hardware_overrides:
+      # MI350P (144 GB, PCIe): TP4 + expert parallel on four GPUs (variant
+      # tp). Tuned on 4x MI350P with the AgentX traces (aiperf, concurrency
+      # 8): 2048 batched tokens and 4 sequences leave a ~400k-token KV cache
+      # (8192 batched tokens do not fit); 131072 tokens of context keep three
+      # long sessions resident. Exact-GPU strategy args come last, so they
+      # override the amd defaults.
+      mi350p: &mi350p_tp4
+        extra_args:
+          - "--enable-expert-parallel"
+          - "--max-model-len"
+          - "131072"
+          - "--max-num-seqs"
+          - "4"
+          - "--max-num-batched-tokens"
+          - "2048"
+          - "--gpu-memory-utilization"
+          - "0.97"
+          - "--enable-prefix-caching"
+  # The same TP4 engine, twice per node (GPUs 0-3 and 4-7) behind vllm-router.
+  single_node_tp_replicas:
+    hardware_overrides:
+      mi350p: *mi350p_tp4
   single_node_tep:
     hardware_overrides:
       blackwell:
@@ -226,6 +298,12 @@ notes:
       hardware: [b300, gb300, mi355x]
       features: [spec_decoding]
     body: "The **DSpark + specialized decode** method is on vLLM main since 2026-11-03 and is not in the `muse-spark-open` images. Serve it from `vllm/vllm-openai:nightly-4fab5a07475822c6eaa971dceb2e2220d0446808` (B300/GB300) or `vllm/vllm-openai-rocm:nightly-4fab5a07475822c6eaa971dceb2e2220d0446808` (MI355X), or a later nightly."
+
+  - title: "Specialized decode on MI350P needs an unmerged change"
+    when:
+      hardware: [mi350p]
+      features: [spec_decoding]
+    body: "**DFlash2 + specialized decode** and **DSpark + specialized decode** on MI350P (128 CUs, PCIe, TP4) need vllm-project/vllm#66836, which is not in a nightly or image yet; build vLLM from that branch. Measured there on 4x MI350P with DFlash2: +27% output tok/s at one request, and on the AgentX traces +11% completed requests with p90 time to first token 4.3 s against 7.0 s."
 
 guide: |
   ## Overview
