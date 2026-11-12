@@ -74,6 +74,10 @@ features:
     # variant's default_modes) and ROCm gfx950 (MI350X/MI355X).
     description: "DSpark speculative decoding, drafting up to seven tokens per pass. On NVIDIA, adaptive verification keeps only the draft slots worth verifying, so it stays on at large batch sizes; on AMD it is a fixed seven-token profile, best for latency-bound serving."
     default_mode: dspark
+    # MI350P serves the DFlash2 draft on the decode monokernel by default:
+    # the configuration validated there (on by default, not opt-in).
+    hardware_default_modes:
+      mi350p: dflash2_specialized
     modes:
       dspark:
         label: "DSpark"
@@ -264,10 +268,16 @@ strategy_overrides:
       # 8): 2048 batched tokens and 4 sequences leave a ~400k-token KV cache
       # (8192 batched tokens do not fit); 131072 tokens of context keep three
       # long sessions resident. Exact-GPU strategy args come last, so they
-      # override the amd defaults.
+      # override the amd defaults (--enable-prefix-caching replaces the amd
+      # --no-enable-prefix-caching). The KV figures assume the fp8 KV cache;
+      # the decode monokernel needs 16-token KV blocks.
       mi350p: &mi350p_tp4
         extra_args:
           - "--enable-expert-parallel"
+          - "--kv-cache-dtype"
+          - "fp8"
+          - "--block-size"
+          - "16"
           - "--max-model-len"
           - "131072"
           - "--max-num-seqs"
@@ -277,6 +287,8 @@ strategy_overrides:
           - "--gpu-memory-utilization"
           - "0.97"
           - "--enable-prefix-caching"
+        extra_env:
+          SAFETENSORS_FAST_GPU: "1"
   # The same TP4 engine, twice per node (GPUs 0-3 and 4-7) behind vllm-router.
   single_node_tp_replicas:
     hardware_overrides:
