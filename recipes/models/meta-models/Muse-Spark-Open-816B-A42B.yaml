@@ -256,9 +256,10 @@ strategy_overrides:
     hardware_overrides:
       # MI350P (144 GB, PCIe): TP4 + expert parallel on four GPUs (variant
       # tp). Tuned on 4x MI350P with the AgentX traces (aiperf, concurrency
-      # 8): 2048 batched tokens and 4 sequences leave a ~400k-token KV cache
-      # (8192 batched tokens do not fit); 131072 tokens of context keep three
-      # long sessions resident. Exact-GPU strategy args come last, so they
+      # 8): 2048 batched tokens and 4 sequences leave a ~565k-token fp8 KV
+      # cache with the fp8 DFlash2 draft (8192 batched tokens do not fit);
+      # 524288 tokens of context fit one long request in it, with margin.
+      # Exact-GPU strategy args come last, so they
       # override the amd defaults (--enable-prefix-caching replaces the amd
       # --no-enable-prefix-caching). The KV figures assume the fp8 KV cache;
       # the decode monokernel needs 16-token KV blocks.
@@ -270,7 +271,7 @@ strategy_overrides:
           - "--block-size"
           - "16"
           - "--max-model-len"
-          - "131072"
+          - "524288"
           - "--max-num-seqs"
           - "4"
           - "--max-num-batched-tokens"
@@ -431,7 +432,7 @@ guide: |
   | --- | --- |
   | `--attention-backend ROCM_AITER_FA` | The monokernel requires it, and the ROCm default is slower with this KV layout. |
   | `--kv-cache-dtype fp8`, `--block-size 16` | fp8 doubles KV capacity; the monokernel needs 16-token KV blocks. |
-  | `--max-model-len 131072` | Fits long agentic sessions while leaving KV cache for several of them; the auto-fit (`-1`) leaves room for only one. |
+  | `--max-model-len 524288` | The KV cache holds about one request of this length, with some margin below the auto-fit (`-1`) size. Shorter requests share the cache; set 131072 to keep several long sessions resident at once. |
   | `--max-num-seqs 4` | Agentic traffic keeps only a few requests in flight per engine; 4 rarely queues, keeps decode steps on the monokernel and leaves more KV cache than larger values. |
   | `--max-num-batched-tokens 2048` | Larger values cost KV cache (8192 and above do not fit at startup) and raise time to first token under load. |
   | `--gpu-memory-utilization 0.97`, `--enable-prefix-caching` | Largest KV cache that starts; multi-turn sessions reuse their prefix. |
