@@ -134,7 +134,7 @@ features:
       # fp8 draft KV cache (the target's 16-token block) and is the fastest.
       dflash2_specialized:
         label: "DFlash2 + specialized decode"
-        description: "Seven-token DFlash2 draft (RadixArk/Muse-Spark-Open-DFlash2) with fp8 draft weights and KV cache, accepting 5.2 tokens a step on GSM8K against 3.96 for DSpark, with the decode monokernel: verify steps of up to four requests run on fused persistent kernels, other steps on the regular path. Runs TP4 + expert parallel on MI350P (one TP4 engine, or two TP4 replicas behind vllm-router) and needs a vLLM build with vllm-project/vllm#66836."
+        description: "Seven-token DFlash2 draft (RadixArk/Muse-Spark-Open-DFlash2) with fp8 draft weights and KV cache, on the decode monokernel: verify steps of up to four requests run on fused persistent kernels, other steps on the regular path. Runs TP4 + expert parallel on MI350P (one TP4 engine, or two TP4 replicas behind vllm-router) and needs a vLLM build with vllm-project/vllm#66836."
         variants: [mxfp4]
         hardware:
           default: unsupported
@@ -309,7 +309,7 @@ notes:
     when:
       hardware: [mi350p]
       features: [spec_decoding]
-    body: "**DFlash2 + specialized decode** and **DSpark + specialized decode** on MI350P (128 CUs, PCIe, TP4) need vllm-project/vllm#66836, which is not in a nightly or image yet; build vLLM from that branch. Measured there on 4x MI350P with DFlash2: +27% output tok/s at one request, and on the AgentX traces +11% completed requests with p90 time to first token 4.3 s against 7.0 s."
+    body: "**DFlash2 + specialized decode** and **DSpark + specialized decode** on MI350P (128 CUs, PCIe, TP4) need vllm-project/vllm#66836, which is not in a nightly or image yet; build vLLM from that branch."
 
 guide: |
   ## Overview
@@ -429,29 +429,20 @@ guide: |
 
   | Setting | Why |
   | --- | --- |
-  | `--attention-backend ROCM_AITER_FA` | The monokernel requires it; the ROCm default is 40-60% slower with this KV layout. |
+  | `--attention-backend ROCM_AITER_FA` | The monokernel requires it, and the ROCm default is slower with this KV layout. |
   | `--kv-cache-dtype fp8`, `--block-size 16` | fp8 doubles KV capacity; the monokernel needs 16-token KV blocks. |
-  | `--max-model-len 131072` | Fits the long agentic sessions; against `-1` (auto-fits ~342k tokens, KV for one such request) it gave 64% more output throughput on the AgentX traces. |
-  | `--max-num-seqs 4` | Agentic traffic keeps ~1.4 requests in flight per engine; 4 rarely queues, keeps every decode step on the monokernel and leaves more KV cache than 16. |
-  | `--max-num-batched-tokens 2048` | 8192 and above do not fit at startup; 2048 leaves 37-51% more KV cache than 4096 and cut p90 time to first token from 29.8 s to 8.5 s. |
+  | `--max-model-len 131072` | Fits long agentic sessions while leaving KV cache for several of them; the auto-fit (`-1`) leaves room for only one. |
+  | `--max-num-seqs 4` | Agentic traffic keeps only a few requests in flight per engine; 4 rarely queues, keeps decode steps on the monokernel and leaves more KV cache than larger values. |
+  | `--max-num-batched-tokens 2048` | Larger values cost KV cache (8192 and above do not fit at startup) and raise time to first token under load. |
   | `--gpu-memory-utilization 0.97`, `--enable-prefix-caching` | Largest KV cache that starts; multi-turn sessions reuse their prefix. |
   | DFlash2 + specialized decode | Seven-token DFlash2 draft (`RadixArk/Muse-Spark-Open-DFlash2`, fp8 weights, `TRITON_ATTN`) with `--monokernel`. |
 
   The command sets `VLLM_KV_CACHE_LAYOUT=LBHNC` (the layout the AMD DSpark
-  modes also use) and `SAFETENSORS_FAST_GPU=1` (faster weight loading). With these settings
-  one engine holds about 566k fp8 KV tokens.
+  modes also use) and `SAFETENSORS_FAST_GPU=1` (faster weight loading).
 
-  DFlash2 accepts 5.2 tokens a step on GSM8K, against 3.96 for DSpark. Its
-  draft attention is non-causal, which `ROCM_AITER_UNIFIED_ATTN` refuses;
-  `TRITON_ATTN` is the fastest backend that accepts it. Measured on one TP4
-  engine (4x MI350P):
-
-  | | Monokernel | Regular decode |
-  | --- | --- | --- |
-  | Output tok/s, 1 request (4k in / 512 out) | 195.7 | 153.6 |
-  | AgentX traces, concurrency 8, 900 s: completed requests | 132 | 119 |
-  | AgentX: p90 time to first token | 4.3 s | 7.0 s |
-  | GSM8K (500 questions) | 0.948 | 0.950 |
+  DFlash2 accepts more draft tokens per step than DSpark. Its draft
+  attention is non-causal, which `ROCM_AITER_UNIFIED_ATTN` refuses;
+  `TRITON_ATTN` is the fastest backend that accepts it.
 
   The monokernel takes verify steps of up to four requests; larger steps run
   the regular path. Every MI350P command carries `--monokernel`, so keep
@@ -580,6 +571,7 @@ guide: |
   - **MI350P, MXFP4** (`--monokernel`): TP4 with expert parallelism, with
     the DSpark or DFlash2 draft, for verify steps of up to four requests;
     see [MI350P](#mi350p-pcie-two-tp4-replicas). Needs vllm-project/vllm#66836.
+    1.27x single-stream output throughput at TP4 + EP4 with DFlash2.
 
   ### Adaptive DSpark (manual opt-in, Triton attention)
 
