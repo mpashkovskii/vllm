@@ -83,6 +83,9 @@ features:
         label: "DSpark"
         description: "Seven-token DSpark profile used for BF16, MXFP4, and NVFP4."
         variants: [bf16, mxfp4, default]
+        # MI350P always runs the monokernel: DSpark there is DSpark + specialized decode.
+        hardware:
+          mi350p: unsupported
         args:
           - "--speculative-config"
           - '{"method":"dspark","model":"Inferact/Muse-Spark-Open-DSpark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}'
@@ -129,21 +132,9 @@ features:
       # Validated on MI350P (TP4 + EP4) only. The DFlash2 draft attention is
       # non-causal, so ROCM_AITER_UNIFIED_ATTN refuses it; TRITON_ATTN keeps an
       # fp8 draft KV cache (the target's 16-token block) and is the fastest.
-      dflash2:
-        label: "DFlash2"
-        description: "Seven-token DFlash2 draft (RadixArk/Muse-Spark-Open-DFlash2) with fp8 draft weights and KV cache. On MI350P it accepts 5.2 tokens a step on GSM8K, against 3.96 for DSpark."
-        variants: [mxfp4]
-        hardware:
-          default: unsupported
-          mi350p: supported
-        args:
-          - "--speculative-config"
-          - '{"method":"dflash","model":"RadixArk/Muse-Spark-Open-DFlash2","quantization":"fp8","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false,"attention_backend":"TRITON_ATTN"}'
-        env:
-          VLLM_KV_CACHE_LAYOUT: "LBHNC"
       dflash2_specialized:
         label: "DFlash2 + specialized decode"
-        description: "DFlash2 with the decode monokernel: verify steps of up to four requests run on fused persistent kernels, other steps on the regular path. Runs TP4 + expert parallel on MI350P (one TP4 engine, or two TP4 replicas behind vllm-router) and needs a vLLM build with vllm-project/vllm#66836."
+        description: "Seven-token DFlash2 draft (RadixArk/Muse-Spark-Open-DFlash2) with fp8 draft weights and KV cache, accepting 5.2 tokens a step on GSM8K against 3.96 for DSpark, with the decode monokernel: verify steps of up to four requests run on fused persistent kernels, other steps on the regular path. Runs TP4 + expert parallel on MI350P (one TP4 engine, or two TP4 replicas behind vllm-router) and needs a vLLM build with vllm-project/vllm#66836."
         variants: [mxfp4]
         hardware:
           default: unsupported
@@ -287,8 +278,11 @@ strategy_overrides:
           - "--gpu-memory-utilization"
           - "0.97"
           - "--enable-prefix-caching"
+          # Decode monokernel (needs spec decoding with seven draft tokens).
+          - "--monokernel"
         extra_env:
           SAFETENSORS_FAST_GPU: "1"
+          VLLM_KV_CACHE_LAYOUT: "LBHNC"
   # The same TP4 engine, twice per node (GPUs 0-3 and 4-7) behind vllm-router.
   single_node_tp_replicas:
     hardware_overrides:
@@ -368,7 +362,8 @@ guide: |
   - **Hardware**: the checkpoints hold ~1.64 TB of weights in BF16 and
     ~509 GB in Quark MXFP4, before KV cache. NVFP4 (~533 GB) is the primary
     NVIDIA Blackwell path and fits one 8-GPU node. On AMD, all three AMD
-    variants are validated on gfx950 (MI350X/MI355X).
+    variants are validated on gfx950 (MI350X/MI355X); MXFP4 also runs on
+    MI350P, see [MI350P](#mi350p-pcie-two-tp4-replicas).
 
   ## NVIDIA
 
@@ -388,7 +383,7 @@ guide: |
 
   | Variant | Checkpoint | AMD hardware | Experts / attention |
   | --- | --- | --- | --- |
-  | MXFP4 | `amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4` | MI350X, MI355X | AITER MXFP4 MoE / AITER FA |
+  | MXFP4 | `amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4` | MI350X, MI355X, MI350P | AITER MXFP4 MoE / AITER FA |
   | BF16 → MXFP4 | `meta-models/Muse-Spark-Open-816B-A42B` | MI350X, MI355X | experts of layers 1-60 rounded to MXFP4 at load, AITER MXFP4 MoE / AITER FA |
   | BF16 | `meta-models/Muse-Spark-Open-816B-A42B` | MI350X, MI355X | Triton BF16 MoE / AITER FA |
 
@@ -396,8 +391,8 @@ guide: |
   run on Triton BF16 MoE.
 
   On AMD, the recipe's commands are text-only (`--language-model-only`), use the
-  V2 model runner, disable prefix caching, enable chunked prefill, and request
-  breakable `FULL_AND_PIECEWISE` graphs. The ROCm MoE path supports the Tensor
+  V2 model runner, disable prefix caching (except on MI350P), enable chunked
+  prefill, and request breakable `FULL_AND_PIECEWISE` graphs. The ROCm MoE path supports the Tensor
   Parallel and Tensor + Expert Parallel strategies; data-parallel strategies
   are not available on AMD.
 
@@ -415,6 +410,54 @@ guide: |
   1M-token context, the MXFP4 variant is validated on TP with
   `--max-model-len 1048576` and `--max-num-seqs 8`, with either the default or
   `--kv-cache-dtype fp8` KV cache.
+
+  ### MI350P (PCIe): two TP4 replicas
+
+  MI350P has 144 GB per GPU and no xGMI between the GPUs. The MXFP4 weights
+  take 129.7 GB per GPU at TP4, so one engine runs **TP4 + expert parallel**
+  on four GPUs, and an 8-GPU node serves **two such engines** (GPUs 0-3 on
+  port 8100, GPUs 4-7 on port 8101) behind `vllm-router` on port 8000 with
+  the `cache_aware` policy, which keeps a conversation on the replica whose
+  prefix cache holds it. This is the default strategy on MI350P (**TP
+  Replicas + Router**); **Tensor Parallel** renders a single TP4 engine.
+  Tensor + Expert Parallel (TP8) is not offered: the decode monokernel runs
+  TP4 only on MI350P's 128-CU GPUs.
+
+  The MI350P command is tuned for agentic, long-context traffic with a few
+  requests in flight per engine, and serves the DFlash2 draft on the decode
+  monokernel by default:
+
+  | Setting | Why |
+  | --- | --- |
+  | `--attention-backend ROCM_AITER_FA` | The monokernel requires it; the ROCm default is 40-60% slower with this KV layout. |
+  | `--kv-cache-dtype fp8`, `--block-size 16` | fp8 doubles KV capacity; the monokernel needs 16-token KV blocks. |
+  | `--max-model-len 131072` | Fits the long agentic sessions; against `-1` (auto-fits ~342k tokens, KV for one such request) it gave 64% more output throughput on the AgentX traces. |
+  | `--max-num-seqs 4` | Agentic traffic keeps ~1.4 requests in flight per engine; 4 rarely queues, keeps every decode step on the monokernel and leaves more KV cache than 16. |
+  | `--max-num-batched-tokens 2048` | 8192 and above do not fit at startup; 2048 leaves 37-51% more KV cache than 4096 and cut p90 time to first token from 29.8 s to 8.5 s. |
+  | `--gpu-memory-utilization 0.97`, `--enable-prefix-caching` | Largest KV cache that starts; multi-turn sessions reuse their prefix. |
+  | DFlash2 + specialized decode | Seven-token DFlash2 draft (`RadixArk/Muse-Spark-Open-DFlash2`, fp8 weights, `TRITON_ATTN`) with `--monokernel`. |
+
+  The command sets `VLLM_KV_CACHE_LAYOUT=LBHNC` (the layout the AMD DSpark
+  modes also use) and `SAFETENSORS_FAST_GPU=1` (faster weight loading). With these settings
+  one engine holds about 566k fp8 KV tokens.
+
+  DFlash2 accepts 5.2 tokens a step on GSM8K, against 3.96 for DSpark. Its
+  draft attention is non-causal, which `ROCM_AITER_UNIFIED_ATTN` refuses;
+  `TRITON_ATTN` is the fastest backend that accepts it. Measured on one TP4
+  engine (4x MI350P):
+
+  | | Monokernel | Regular decode |
+  | --- | --- | --- |
+  | Output tok/s, 1 request (4k in / 512 out) | 195.7 | 153.6 |
+  | AgentX traces, concurrency 8, 900 s: completed requests | 132 | 119 |
+  | AgentX: p90 time to first token | 4.3 s | 7.0 s |
+  | GSM8K (500 questions) | 0.948 | 0.950 |
+
+  The monokernel takes verify steps of up to four requests; larger steps run
+  the regular path. Every MI350P command carries `--monokernel`, so keep
+  **Spec Decoding** on: without a seven-token draft vLLM refuses to start.
+  It needs vllm-project/vllm#66836, which is not in a nightly yet; on a build
+  without it, drop `--monokernel` (DFlash2 still runs on the regular path).
 
   ## Launching the Server
 
@@ -512,7 +555,7 @@ guide: |
   keep `--max-num-seqs 32`. For throughput beyond about 64 concurrent
   requests, use expert parallelism without DSpark.
 
-  ### Specialized decode (B300, GB300, MI355X)
+  ### Specialized decode (B300, GB300, MI355X, MI350P)
 
   The **DSpark + specialized decode** method runs DSpark verify steps on fused
   persistent kernels and leaves prefill and other steps on the regular path.
@@ -534,6 +577,9 @@ guide: |
     activations in bf16 (MXFP4 weights x bf16 activations) instead of the
     checkpoint's W4A4, so outputs are close to, but not bit-identical with,
     the regular path.
+  - **MI350P, MXFP4** (`--monokernel`): TP4 with expert parallelism, with
+    the DSpark or DFlash2 draft, for verify steps of up to four requests;
+    see [MI350P](#mi350p-pcie-two-tp4-replicas). Needs vllm-project/vllm#66836.
 
   ### Adaptive DSpark (manual opt-in, Triton attention)
 
