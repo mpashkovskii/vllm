@@ -46,9 +46,22 @@ def _bounded_topk_sample_kernel(
     ids = tl.load(idx_ptr + row * idx_stride + cols, mask=in_range, other=0)
     ids = ids.to(tl.int64)
     top_k = tl.load(top_k_ptr + req)
-    live = in_range & (cols < top_k)
-    vals = tl.load(logits_ptr + row * logits_stride + ids, mask=live, other=float("-inf"))
+    vals = tl.load(
+        logits_ptr + row * logits_stride + ids, mask=in_range, other=float("-inf")
+    )
     vals = vals.to(tl.float32)
+
+    # The selector returns the KMAX best columns in no particular order; a
+    # request with top_k < KMAX keeps only the top_k best of them (ties broken
+    # by column position).
+    cols_row = tl.broadcast_to(cols[None, :], (KBLOCK, KBLOCK))
+    vals_row = tl.broadcast_to(vals[None, :], (KBLOCK, KBLOCK))
+    better = (vals_row > vals[:, None]) | (
+        (vals_row == vals[:, None]) & (cols_row < cols[:, None])
+    )
+    rank = tl.sum(better.to(tl.int32), axis=1)
+    live = in_range & (rank < top_k)
+    vals = tl.where(live, vals, float("-inf"))
 
     temp = tl.load(temp_ptr + req).to(tl.float32)
     if temp != 0.0 and temp != 1.0:
