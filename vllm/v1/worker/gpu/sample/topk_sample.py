@@ -96,8 +96,12 @@ def _bounded_topk_sample_kernel(
         USE_FP64=USE_FP64,
         APPLY_TEMPERATURE=False,
     )
-    token = tl.sum(tl.where(cols == arg, ids, 0), axis=0)
-    tl.store(sampled_ptr + row, token)
+    sampled = tl.sum(tl.where(cols == arg, ids, 0), axis=0)
+    # Greedy requests take the lowest token id among tied maxima, as the stock
+    # path does; the selector's column order is not stable between calls.
+    best = tl.max(vals, axis=0)
+    greedy = tl.min(tl.where(vals == best, ids, 0x7FFFFFFFFFFFFFFF), axis=0)
+    tl.store(sampled_ptr + row, tl.where(temp == 0.0, greedy, sampled))
 
 
 def bounded_topk_available() -> bool:

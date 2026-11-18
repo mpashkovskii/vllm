@@ -74,3 +74,11 @@ def test_mixed_per_request_top_k_stays_in_support():
     sampled = bounded_topk_sample(logits, 64, mapping, k, p, t, seeds, pos)
     rank = (logits > logits.gather(1, sampled[:, None])).sum(dim=1)
     assert torch.all(rank < k)
+
+
+def test_greedy_ties_take_the_lowest_token_id():
+    logits, mapping, k, p, t, seeds, pos = _inputs(64, 64, 0.95, 0.0)
+    logits[:, [4000, 100, 20000]] = 1000.0
+    for _ in range(3):
+        actual = bounded_topk_sample(logits, 64, mapping, k, p, t, seeds, pos)
+        assert torch.all(actual == 100)
