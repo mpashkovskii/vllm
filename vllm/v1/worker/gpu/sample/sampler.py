@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -34,6 +35,11 @@ from vllm.v1.worker.gpu.sample.logprob import (
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
+from vllm.v1.worker.gpu.sample.topk_sample import (
+    BOUNDED_TOPK_MAX,
+    bounded_topk_available,
+    bounded_topk_sample,
+)
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
@@ -83,6 +89,7 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        self.needs_other_processing = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -92,15 +99,22 @@ class Sampler:
         self.use_xpu_sampler = (
             not return_sampling_mask and not use_fp64_gumbel and xpu_sampler_supported()
         )
+        self.use_bounded_topk = (
+            not return_sampling_mask
+            and not self.use_flashinfer
+            and not self.use_xpu_sampler
+            and envs.VLLM_ROCM_BOUNDED_TOPK_SAMPLER
+            and current_platform.is_rocm()
+            and bounded_topk_available()
+        )
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
-            req_idx, sampling_params
-        )
+        needs_other = self.thinking_budget_state.add_request(req_idx, sampling_params)
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing
+            needs_other |= processor.add_request(req_idx, sampling_params)
+        self.needs_other_processing[req_idx] = needs_other
+        self.needs_logits_processing[req_idx] = needs_processing | needs_other
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
@@ -275,6 +289,22 @@ class Sampler:
             logits, expanded_idx_mapping, idx_mapping_np
         )
 
+    def _bounded_top_k(
+        self, idx_mapping_np: np.ndarray, return_logprobs: bool
+    ) -> int | None:
+        """The batch's largest top_k when the bounded path can serve it."""
+        if not self.use_bounded_topk:
+            return None
+        if return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+            return None
+        if self.needs_other_processing[idx_mapping_np].any():
+            return None
+        states = self.sampling_states
+        if states.min_p.np[idx_mapping_np].any():
+            return None
+        max_top_k = int(states.top_k.np[idx_mapping_np].max())
+        return max_top_k if max_top_k <= BOUNDED_TOPK_MAX else None
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -287,6 +317,22 @@ class Sampler:
         seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_top_k = self._bounded_top_k(idx_mapping_np, return_logprobs)
+        if max_top_k is not None:
+            states = self.sampling_states
+            do_top_p = bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
+            sampled = bounded_topk_sample(
+                logits,
+                max_top_k,
+                expanded_idx_mapping,
+                states.top_k.gpu,
+                states.top_p.gpu if do_top_p else None,
+                states.temperature.gpu,
+                states.seeds.gpu,
+                pos,
+                use_fp64=self.use_fp64_gumbel,
+            )
+            return sampled, logits
         processed_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,
