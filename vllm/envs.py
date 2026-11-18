@@ -329,6 +329,7 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_ROCM_BOUNDED_TOPK_SAMPLER: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2224,6 +2225,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_XPU_FORCE_N_CONTIG_WEIGHT", "0"))
     ),
     # whether use xpu specific sample kernel
+    "VLLM_ROCM_BOUNDED_TOPK_SAMPLER": lambda: bool(
+        int(os.getenv("VLLM_ROCM_BOUNDED_TOPK_SAMPLER", "1"))
+    ),
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
     ),
