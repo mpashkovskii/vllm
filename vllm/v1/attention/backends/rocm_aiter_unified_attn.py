@@ -226,6 +226,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         from vllm.platforms.rocm import on_gfx11
 
         self.unified_attention = unified_attention
+        self._triton_prefill_hd256 = envs.VLLM_ROCM_UNIFIED_ATTN_HD256_TRITON_PREFILL
         # RDNA3 has no low precision MMA, preserve query precision
         self.supports_quant_query_input = not on_gfx11()
 
@@ -338,6 +339,15 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
+        # gfx950: at head size 256 the Triton 2D kernel runs long prefill chunks
+        # ~20% faster than the Gluon kernel (decode batches stay on Gluon).
+        backend = (
+            "triton"
+            if self._triton_prefill_hd256
+            and self.head_size == 256
+            and max_seqlen_q >= 256
+            else None
+        )
         nd = getattr(attn_metadata, "num_decodes", 0)
         if nd and attn_metadata.causal:
             # Mixed batch: decodes (first nd requests) take the split-KV decode
@@ -375,6 +385,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k[nd:],
                 block_table=block_table[nd:],
+                backend=backend,
                 **common,
             )
         elif attn_metadata.causal:
@@ -399,6 +410,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 sinks=self.sinks,
                 output_scale=output_scale,
                 shuffled_kv_cache=self._use_shuffle_kv,
+                backend=backend,
             )
         else:
             # The aiter kernel is causal-only. Non-causal cross-attention

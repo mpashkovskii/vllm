@@ -333,6 +333,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
+    VLLM_ROCM_UNIFIED_ATTN_HD256_TRITON_PREFILL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2232,6 +2233,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # their own (split-KV) launch instead of the prefill 2D kernel
     "VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE", "1"))
+    ),
+    # ROCM_AITER_UNIFIED_ATTN, head size 256: Triton 2D kernel for long prefill
+    # chunks (faster than the Gluon kernel on gfx950)
+    "VLLM_ROCM_UNIFIED_ATTN_HD256_TRITON_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_ROCM_UNIFIED_ATTN_HD256_TRITON_PREFILL", "1"))
     ),
     "VLLM_ROCM_BOUNDED_TOPK_SAMPLER": lambda: bool(
         int(os.getenv("VLLM_ROCM_BOUNDED_TOPK_SAMPLER", "1"))
