@@ -464,7 +464,9 @@ class RopeReshapeKVCacheUnsplitPattern:
 
     def _unfused(self, q, k, v, positions, cos_sin_cache, layer_name):
         q, k = self.rope_matcher(positions, q, k, cos_sin_cache)
-        k = k.view(-1, self.num_kv_heads, self.head_size)
+        # Explicit token count: the compiled graph reshapes with the symbolic
+        # batch size, which a literal -1 in the pattern would not match.
+        k = k.view(k.shape[0], self.num_kv_heads, self.head_size)
         return torch.ops.vllm.unified_kv_cache_update(k, v, layer_name), q, k
 
     def _mk_pattern_and_replacement(self, _ln):
