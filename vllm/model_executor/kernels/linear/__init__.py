@@ -215,6 +215,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.humming import (
     HummingFP8ScaledMMLinearKernel,
     HummingInt8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.flydsl import (
+    FlyDSLPerTokenFp8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
     MarlinFP8ScaledMMLinearKernel,
 )
@@ -471,6 +474,7 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         AiterPerTokenFp8ScaledMMLinearKernel,
         ROCmFP8ScaledMMLinearKernel,
         PerTensorTorchFP8ScaledMMLinearKernel,
+        FlyDSLPerTokenFp8ScaledMMLinearKernel,
         RowWiseTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
     ],
@@ -1389,6 +1393,7 @@ __all__ = [
     "ChannelWiseTorchFP8ScaledMMLinearKernel",
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",
+    "FlyDSLPerTokenFp8ScaledMMLinearKernel",
     "ROCmFP8ScaledMMLinearKernel",
     "TritonInt8ScaledMMLinearKernel",
     "ZentorchInt8ScaledMMLinearKernel",
