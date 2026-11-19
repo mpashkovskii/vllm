@@ -129,6 +129,13 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         key: torch.Tensor | None,
         cos_sin_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Functionalization materializes schema defaults into the graph's
+        # auto_functionalized node, so the pattern must carry them too.
+        extra = (
+            {"rope_dim_offset": 0, "inverse": False}
+            if self.rotary_op is ROTARY_OP
+            else {}
+        )
         result = auto_functionalized(
             self.rotary_op,
             positions=positions,
@@ -137,6 +144,7 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
             head_size=self.head_size,
             cos_sin_cache=cos_sin_cache,
             is_neox=self.is_neox,
+            **extra,
         )
         query_out = result[1]
         key_out = result[2] if len(result) > 2 else None
