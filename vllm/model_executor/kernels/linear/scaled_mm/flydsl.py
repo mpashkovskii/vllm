@@ -56,6 +56,57 @@ _CONFIGS: dict[tuple[int, int], list[tuple[int, _Cfg | None]]] = {
 }
 
 
+# (N, K) -> {tokens: hipBLASLt solution index} for the CUDA-graph capture sizes
+# where a specific row-wise hipBLASLt solution (hipb_findallsols, timed per M)
+# beats both torch._scaled_mm's heuristic pick and the FlyDSL ranges above.
+# Solution indices belong to the installed hipBLASLt build.
+_HIPB_SOLUTIONS: dict[tuple[int, int], dict[int, int]] = {
+    (20480, 2560): {
+        168: 33923,
+        176: 33923,
+        184: 33923,
+        192: 33923,
+        224: 33819,
+        256: 33818,
+        416: 33797,
+        448: 33819,
+    },
+    (2560, 10240): {
+        40: 33832,
+        48: 33832,
+        56: 33832,
+        64: 33824,
+        72: 33831,
+        80: 33831,
+        88: 33831,
+        96: 33831,
+        120: 33830,
+        128: 33822,
+        200: 33827,
+        208: 33822,
+        232: 33822,
+        240: 33822,
+        248: 33822,
+        256: 33822,
+        336: 34120,
+        352: 34120,
+        368: 33830,
+        384: 33804,
+    },
+}
+_hipb_ready = False
+_hipb_failed: set[tuple[int, int, int]] = set()
+
+
+def _ensure_hipb() -> None:
+    global _hipb_ready
+    if not _hipb_ready:
+        import aiter
+
+        aiter.hipb_create_extension()
+        _hipb_ready = True
+
+
 def _lookup(m: int, n: int, k: int) -> _Cfg | None:
     for max_m, cfg in _CONFIGS.get((n, k), ()):
         if m <= max_m:
@@ -73,6 +124,24 @@ def _flydsl_ptpc_gemm_impl(
     m = A.shape[0]
     n = B_shuffled.shape[0]
     k = A.shape[1]
+    sol = _HIPB_SOLUTIONS.get((n, k), {}).get(m)
+    if sol is not None and (m, n, k) not in _hipb_failed:
+        try:
+            import aiter
+
+            _ensure_hipb()
+            return aiter.hipb_mm(
+                A,
+                B,
+                solution_index=sol,
+                out_dtype=torch.bfloat16,
+                scaleA=As,
+                scaleB=Bs.t(),
+                bpreshuffle=False,
+            )
+        except Exception as e:
+            _hipb_failed.add((m, n, k))
+            logger.warning_once("hipBLASLt solution %d failed for M=%d N=%d K=%d: %s", sol, m, n, k, e)
     cfg = _lookup(m, n, k)
     if cfg is None:
         return torch._scaled_mm(
@@ -171,6 +240,7 @@ class FlyDSLPerTokenFp8ScaledMMLinearKernel(RowWiseTorchFP8ScaledMMLinearKernel)
         # w is the [K, N] view of the [N, K] quantized weight
         from aiter.ops.shuffle import shuffle_weight
 
+        _ensure_hipb()
         shuffled = shuffle_weight(w.t().contiguous(), layout=(16, 16))
         layer.register_parameter(
             f"{w_name}_shuffled", torch.nn.Parameter(shuffled, requires_grad=False)
