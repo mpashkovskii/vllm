@@ -332,6 +332,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_BOUNDED_TOPK_SAMPLER: bool = True
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
+    VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2227,6 +2228,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_XPU_FORCE_N_CONTIG_WEIGHT", "0"))
     ),
     # whether use xpu specific sample kernel
+    # ROCM_AITER_UNIFIED_ATTN: run the decode requests of a mixed batch through
+    # their own (split-KV) launch instead of the prefill 2D kernel
+    "VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE": lambda: bool(
+        int(os.getenv("VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE", "1"))
+    ),
     "VLLM_ROCM_BOUNDED_TOPK_SAMPLER": lambda: bool(
         int(os.getenv("VLLM_ROCM_BOUNDED_TOPK_SAMPLER", "1"))
     ),
