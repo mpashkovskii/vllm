@@ -332,6 +332,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_BOUNDED_TOPK_SAMPLER: bool = True
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
+    VLLM_ROCM_FLYDSL_MX_MLP: bool = True
+    VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS: int = 2048
     VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
     VLLM_ROCM_UNIFIED_ATTN_HD256_TRITON_PREFILL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
@@ -2249,6 +2251,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Fuse GeluAndMul(tanh) with the per-token FP8 quantization of the input of
     # the FP8 down_proj that follows it (ROCm, Gemma-style MLPs)
+    # Prefill-size FP8 gated MLP (gate_up GEMM with a fused GeLU*up + MX quant
+    # epilogue, then an MX down GEMM) through AITER's FlyDSL 8-wave kernels.
+    "VLLM_ROCM_FLYDSL_MX_MLP": lambda: bool(
+        int(os.getenv("VLLM_ROCM_FLYDSL_MX_MLP", "1"))
+    ),
+    # Smallest token count that takes the fused MX MLP path.
+    "VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS", "2048")
+    ),
     "VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT": lambda: bool(
         int(os.getenv("VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT", "1"))
     ),
