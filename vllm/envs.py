@@ -333,6 +333,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE: bool = True
+    VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS: int = 1024
     VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
@@ -2268,6 +2269,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8 KV cache): q/k/v RMSNorm + RoPE + FP8 q quant + FP8 KV cache write
     "VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE": lambda: bool(
         int(os.getenv("VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE", "1"))
+    ),
+    # Gemma4 decoder-layer residual / RMSNorm chain (post-attn norm + add + pre-FF norm
+    # (+ FP8 quant), post-FF norm + add, PLE norm + add + layer scalar + next input norm)
+    # in three row-wise Triton kernels
+    "VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN": lambda: bool(
+        int(os.getenv("VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN", "1"))
     ),
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
