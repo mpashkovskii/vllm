@@ -195,7 +195,9 @@ def _mx_unit_scale(device: torch.device, n: int, k: int) -> torch.Tensor:
     key = (device, n, k)
     t = _MX_UNIT_SCALES.get(key)
     if t is None:
-        t = torch.full((n, k // 32), 127, dtype=torch.uint8, device=device)
+        t = torch.full(
+            (-(-n // 256) * 256 * (k // 32),), 127, dtype=torch.uint8, device=device
+        )
         _MX_UNIT_SCALES[key] = t
     return t
 
@@ -222,7 +224,9 @@ def _flydsl_gelu_mlp_mx_impl(
         )
 
         act = torch.empty((m, inter), dtype=x_q.dtype, device=x_q.device)
-        act_sc = torch.empty((m, inter // 32), dtype=torch.uint8, device=x_q.device)
+        act_sc = torch.empty(
+            -(-m // 256) * 256 * (inter // 32), dtype=torch.uint8, device=x_q.device
+        )
         flydsl_gate_up_gelu_mx(x_q, w1_il, x_s, w1_s_il, act, act_sc)
         out = torch.empty((m, w2_shuffled.shape[0]), dtype=torch.bfloat16, device=x_q.device)
         flydsl_mx_down(act, act_sc, w2_shuffled, w2_unit, w2_s.reshape(-1), out)
