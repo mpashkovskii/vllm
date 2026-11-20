@@ -565,7 +565,8 @@ class Gemma4Attention(nn.Module):
             and rope.rotary_dim == self.head_dim
             and self.q_norm.weight.dtype == torch.bfloat16
             and self.head_dim % 2 == 0
-            and self.num_heads % self.num_kv_heads == 0
+            and (self.num_heads & (self.num_heads - 1)) == 0
+            and (self.num_kv_heads & (self.num_kv_heads - 1)) == 0
         )
 
     def forward(

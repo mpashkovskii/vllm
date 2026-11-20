@@ -183,9 +183,11 @@ def qkv_glue(
     rot_pairs: int,
     eps: float,
     num_warps: int = 1,
-    rq: int = 2,
-    rkv: int = 2,
+    rq: int | None = None,
+    rkv: int | None = None,
 ) -> torch.Tensor:
+    rq = rq or num_heads
+    rkv = rkv or num_kv_heads
     num_tokens = qkv.shape[0]
     out = torch.empty(
         (num_tokens, num_heads * head_dim),
