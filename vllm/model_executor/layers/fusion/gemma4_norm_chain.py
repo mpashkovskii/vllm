@@ -11,8 +11,10 @@ layer's attention, these memory-bound ops on [tokens, hidden] tensors:
 
 Unfused they are eight kernels and about 1.55 GB of HBM traffic per layer at 16k tokens; one program
 per row holds the row in registers, so each kernel is a single pass. The bf16 rounding points of the
-unfused chain are kept (each norm output, each add); the FP8 quantization follows AITER's
-rmsnorm_quant (fp32 norm output, scale = amax / fp8_max, multiply by the reciprocal).
+eager chain are kept (each norm output and each add is rounded to bf16); the compiled unfused graph fuses
+the last add with the layer scalar without the intermediate rounding, so K_C differs from it by one bf16
+ulp on some elements. The FP8 quantization follows AITER's rmsnorm_quant (fp32 norm output,
+scale = amax / fp8_max, multiply by the reciprocal).
 """
 
 import torch
@@ -203,11 +205,6 @@ def _ple_kernel(
         _store_bf16(nx_ptr + row * stride_nx, q0, q1, o0, o1, T1)
 
 
-def _cfg(n: int):
-    t0, t1 = _split(n)
-    return t0, t1
-
-
 def attn_ff_norm(
     attn: torch.Tensor,
     residual: torch.Tensor,
@@ -226,7 +223,7 @@ def attn_ff_norm(
         y = torch.empty_like(attn)
         ys = torch.empty((0, 1), dtype=torch.float32, device=attn.device)
     if m:
-        t0, t1 = _cfg(n)
+        t0, t1 = _split(n)
         _attn_ff_kernel[(m,)](
             attn,
             residual,
@@ -260,7 +257,7 @@ def post_ff_norm_add(
     m, n = mlp.shape
     out = torch.empty_like(mlp)
     if m:
-        t0, t1 = _cfg(n)
+        t0, t1 = _split(n)
         _post_ff_kernel[(m,)](
             mlp,
             residual,
@@ -291,7 +288,7 @@ def ple_norm_add_scale(
     out = torch.empty_like(proj)
     nxt = torch.empty_like(proj) if w_next is not None else torch.empty((0, n), dtype=proj.dtype, device=proj.device)
     if m:
-        t0, t1 = _cfg(n)
+        t0, t1 = _split(n)
         _ple_kernel[(m,)](
             proj,
             residual,
