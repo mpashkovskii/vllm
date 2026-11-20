@@ -6,6 +6,8 @@ on:
       - .github/workflows/ci-command-tests.yml
       - .github/workflows/scripts/run_ci_command.py
       - .github/workflows/scripts/test_run_ci_command.py
+      - .github/workflows/scripts/model_scope.py
+      - .github/workflows/scripts/test_model_scope.py
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,3 +28,5 @@ jobs:
         python-version: "3.12"
     - name: Run the /ci command unit tests
       run: uv run --no-project --python 3.12 .github/workflows/scripts/test_run_ci_command.py
+    - name: Run the model scope unit tests
+      run: uv run --no-project --python 3.12 --with regex .github/workflows/scripts/test_model_scope.py
