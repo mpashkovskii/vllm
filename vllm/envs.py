@@ -332,6 +332,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_BOUNDED_TOPK_SAMPLER: bool = True
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
+    VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS: int = 1024
     VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
@@ -2262,6 +2263,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT": lambda: bool(
         int(os.getenv("VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT", "1"))
+    ),
+    # Gemma4 attention input glue in one Triton kernel (ROCm unified attention,
+    # fp8 KV cache): q/k/v RMSNorm + RoPE + FP8 q quant + FP8 KV cache write
+    "VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE": lambda: bool(
+        int(os.getenv("VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE", "1"))
     ),
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
