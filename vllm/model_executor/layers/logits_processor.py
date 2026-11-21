@@ -8,6 +8,7 @@ from functools import cache
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
@@ -111,13 +112,27 @@ class LogitsProcessor(PluggableLayer):
             )
         if logits is not None:
             if self.soft_cap is not None:
-                logits = logits / self.soft_cap
-                logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
+                capped = self._fused_soft_cap(logits)
+                if capped is None:
+                    logits = logits / self.soft_cap
+                    logits = torch.tanh(logits)
+                    logits = logits * self.soft_cap
+                else:
+                    logits = capped
 
             if self.scale != 1.0:
                 logits *= self.scale
         return logits
+
+    def _fused_soft_cap(self, logits: torch.Tensor) -> torch.Tensor | None:
+        """One-pass soft cap on ROCm, in fp32 when the bounded top-k sampler consumes it
+        (its selector needs fp32, and bf16 -> fp32 is exact), else in the logits dtype."""
+        if not (current_platform.is_rocm() and envs.VLLM_ROCM_FUSED_LOGIT_SOFTCAP):
+            return None
+        from vllm.model_executor.layers.fusion.logit_softcap import fused_logit_softcap
+
+        out_dtype = torch.float32 if envs.VLLM_ROCM_BOUNDED_TOPK_SAMPLER else None
+        return fused_logit_softcap(logits, self.soft_cap, out_dtype)
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """gather/all-gather the logits tensor across model parallel group."""

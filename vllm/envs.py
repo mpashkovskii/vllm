@@ -330,6 +330,7 @@ if TYPE_CHECKING:
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_ROCM_BOUNDED_TOPK_SAMPLER: bool = True
+    VLLM_ROCM_FUSED_LOGIT_SOFTCAP: bool = True
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE: bool = True
@@ -2245,6 +2246,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_BOUNDED_TOPK_SAMPLER": lambda: bool(
         int(os.getenv("VLLM_ROCM_BOUNDED_TOPK_SAMPLER", "1"))
+    ),
+    # One-pass final-logit soft cap (bit-identical to the eager chain) that
+    # also writes the bounded top-k selector's fp32 input
+    "VLLM_ROCM_FUSED_LOGIT_SOFTCAP": lambda: bool(
+        int(os.getenv("VLLM_ROCM_FUSED_LOGIT_SOFTCAP", "1"))
     ),
     # FlyDSL per-token x per-channel FP8 GEMMs for the token counts where
     # row-wise torch._scaled_mm is slow (ROCm gfx950, tuned shapes only)
