@@ -2702,6 +2702,68 @@ def _sparse_attn_decode_ragged_kernel(
 
 
 @triton.jit
+def _sparse_attn_partial_load_tile(
+    cache_ptr,
+    slot_raw,
+    cache_stride0,
+    block_size,
+    in_range,
+    num_rows,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # One BLOCK_K-row tile of the K cache: nope bytes + per-64-dim ue8m0
+    # scales + bf16 rope. The 8 scale bytes are loaded as one [BLOCK_K, 8]
+    # group and broadcast to the nope columns instead of a per-column byte
+    # gather.
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < NOPE_DIM
+    rope_offsets = tl.arange(0, ROPE_DIM)
+    scl_offsets = tl.arange(0, NOPE_BLOCK // 64)
+    scl_mask = scl_offsets < (NOPE_DIM + 63) // 64
+    valid = in_range & (slot_raw >= 0) & (slot_raw < num_rows)
+    safe_slot = tl.where(valid, slot_raw, 0)
+    block_idx = safe_slot // block_size
+    pos_in_block = safe_slot % block_size
+    cache_block_ptr = cache_ptr + block_idx.to(tl.int64) * cache_stride0
+    token_data_ptr = cache_block_ptr + pos_in_block * 576
+    token_scale_ptr = cache_block_ptr + block_size * 576 + pos_in_block * 8
+    encoded_scales = tl.load(
+        token_scale_ptr[:, None] + scl_offsets[None, :],
+        mask=valid[:, None] & scl_mask[None, :],
+        other=127,
+    )
+    scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+    x_uint8 = tl.load(
+        token_data_ptr[:, None] + nope_offsets[None, :],
+        mask=valid[:, None] & nope_mask[None, :],
+        other=0,
+    )
+    if IS_FNUZ:
+        x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+    else:
+        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+    k_nope = x_fp8.to(tl.bfloat16) * tl.reshape(
+        tl.broadcast_to(scales[:, :, None], (BLOCK_K, NOPE_BLOCK // 64, 64)),
+        (BLOCK_K, NOPE_BLOCK),
+    ).to(tl.bfloat16)
+    k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, 0.0)
+    k_nope = tl.where(k_nope == k_nope, k_nope, 0.0)
+    rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    k_rope = tl.load(
+        rope_ptr[:, None] + rope_offsets[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+    k_rope = tl.where(valid[:, None], k_rope, 0.0)
+    k_rope = tl.where(k_rope == k_rope, k_rope, 0.0)
+    return k_nope, k_rope, valid
+
+
+@triton.jit
 def _sparse_attn_decode_partial_kernel(
     q_ptr,
     main_cache_ptr,
@@ -2772,9 +2834,6 @@ def _sparse_attn_decode_partial_kernel(
     acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
     k_offsets = tl.arange(0, BLOCK_K)
 
-    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
-    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
-
     # Each split processes a contiguous slice of this query's main (SWA) and
     # extra (topk) segments. Slices are handled independently so a block never
     # straddles the main/extra boundary.
@@ -2785,118 +2844,35 @@ def _sparse_attn_decode_partial_kernel(
     main_lo = split_id * main_chunk
     main_hi = tl.minimum(main_lo + main_chunk, main_len)
 
-    for k_start in tl.range(main_lo, main_hi, BLOCK_K, num_stages=NUM_STAGES):
-        k_pos = k_start + k_offsets
+    n_main = main_hi - main_lo
+    if n_main > 0:
+        k_pos = main_lo + k_offsets
         in_range = k_pos < main_hi
         slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
-        valid = in_range & (slot >= 0) & (slot < main_num_rows)
-        safe_slot = tl.where(valid, slot, 0)
-
-        block_idx = safe_slot // main_block_size
-        pos_in_block = safe_slot % main_block_size
-        cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data_ptr = cache_block_ptr + pos_in_block * 576
-        token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
-
-        x_uint8 = tl.load(
-            token_data_ptr[:, None] + nope_offsets[None, :],
-            mask=valid[:, None] & nope_mask[None, :],
-            other=0,
+        k_nope, k_rope, valid = _sparse_attn_partial_load_tile(
+            main_cache_ptr, slot, main_cache_stride0, main_block_size,
+            in_range, main_num_rows, NOPE_DIM, NOPE_BLOCK, ROPE_DIM,
+            IS_FNUZ_MAIN, BLOCK_K,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        encoded_scales = tl.load(
-            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-            mask=valid[:, None] & nope_mask[None, :],
-            other=127,
-        )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
-        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
-
-        rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-        k_rope = tl.load(
-            rope_ptr[:, None] + rope_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
-        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
-
-        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
-        scores *= scale
-        scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
-
-        m_block = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new[:, None])
-        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
-        l_new = l_i * alpha + tl.sum(p, axis=1)
-
-        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
-        m_i = m_new
-        l_i = l_new
-
-    if HAS_EXTRA:
-        extra_start = tl.load(extra_indptr_ptr + query_idx)
-        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
-        extra_len = extra_end - extra_start
-        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
-        extra_lo = split_id * extra_chunk
-        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
-
-        for k_start in tl.range(extra_lo, extra_hi, BLOCK_K, num_stages=NUM_STAGES):
-            k_pos = k_start + k_offsets
-            in_range = k_pos < extra_hi
-            slot = tl.load(
-                extra_indices_ptr + extra_start + k_pos, mask=in_range, other=-1
+        # Software-pipelined gather: every iteration computes with the tile
+        # loaded one round earlier while the next tile's scattered loads are
+        # already in flight (the tl.range num_stages=1 code exposed the full
+        # gather latency every iteration).
+        niters = tl.cdiv(n_main, BLOCK_K)
+        for it in range(1, niters + 1):
+            in_next = (it < niters) & (
+                ((main_lo + it * BLOCK_K) + k_offsets) < main_hi
             )
-            valid = in_range & (slot >= 0) & (slot < extra_num_rows)
-            safe_slot = tl.where(valid, slot, 0)
-
-            block_idx = safe_slot // extra_block_size
-            pos_in_block = safe_slot % extra_block_size
-            cache_block_ptr = (
-                extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+            slot_next = tl.load(
+                main_indices_ptr + main_start + main_lo + it * BLOCK_K + k_offsets,
+                mask=in_next,
+                other=-1,
             )
-            token_data_ptr = cache_block_ptr + pos_in_block * 576
-            token_scale_ptr = (
-                cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
+            k_nope_next, k_rope_next, valid_next = _sparse_attn_partial_load_tile(
+                main_cache_ptr, slot_next, main_cache_stride0, main_block_size,
+                in_next, main_num_rows, NOPE_DIM, NOPE_BLOCK, ROPE_DIM,
+                IS_FNUZ_MAIN, BLOCK_K,
             )
-
-            x_uint8 = tl.load(
-                token_data_ptr[:, None] + nope_offsets[None, :],
-                mask=valid[:, None] & nope_mask[None, :],
-                other=0,
-            )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            encoded_scales = tl.load(
-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-                mask=valid[:, None] & nope_mask[None, :],
-                other=127,
-            )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
-            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
-
-            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-            k_rope = tl.load(
-                rope_ptr[:, None] + rope_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
-            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
-            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
-
             scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
                 q_rope,
                 tl.trans(k_rope),
@@ -2915,6 +2891,61 @@ def _sparse_attn_decode_partial_kernel(
             acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
             m_i = m_new
             l_i = l_new
+            k_nope, k_rope, valid = k_nope_next, k_rope_next, valid_next
+
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + query_idx)
+        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+        extra_len = extra_end - extra_start
+        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
+        extra_lo = split_id * extra_chunk
+        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
+        n_extra = extra_hi - extra_lo
+        if n_extra > 0:
+            k_pos = extra_lo + k_offsets
+            in_range = k_pos < extra_hi
+            slot = tl.load(
+                extra_indices_ptr + extra_start + k_pos, mask=in_range, other=-1
+            )
+            k_nope, k_rope, valid = _sparse_attn_partial_load_tile(
+                extra_cache_ptr, slot, extra_cache_stride0, extra_block_size,
+                in_range, extra_num_rows, NOPE_DIM, NOPE_BLOCK, ROPE_DIM,
+                IS_FNUZ_EXTRA, BLOCK_K,
+            )
+            niters = tl.cdiv(n_extra, BLOCK_K)
+            for it in range(1, niters + 1):
+                in_next = (it < niters) & (
+                    ((extra_lo + it * BLOCK_K) + k_offsets) < extra_hi
+                )
+                slot_next = tl.load(
+                    extra_indices_ptr + extra_start + extra_lo + it * BLOCK_K + k_offsets,
+                    mask=in_next,
+                    other=-1,
+                )
+                k_nope_next, k_rope_next, valid_next = _sparse_attn_partial_load_tile(
+                    extra_cache_ptr, slot_next, extra_cache_stride0, extra_block_size,
+                    in_next, extra_num_rows, NOPE_DIM, NOPE_BLOCK, ROPE_DIM,
+                    IS_FNUZ_EXTRA, BLOCK_K,
+                )
+                scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
+                    q_rope,
+                    tl.trans(k_rope),
+                )
+                scores *= scale
+                scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+
+                m_block = tl.max(scores, axis=1)
+                m_new = tl.maximum(m_i, m_block)
+                alpha = tl.exp(m_i - m_new)
+                p = tl.exp(scores - m_new[:, None])
+                p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+                l_new = l_i * alpha + tl.sum(p, axis=1)
+
+                acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+                acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+                m_i = m_new
+                l_i = l_new
+                k_nope, k_rope, valid = k_nope_next, k_rope_next, valid_next
 
     # Store raw (un-normalized) partial state for this split. Softmax sink and
     # final normalization happen in the reduce kernel.
@@ -2937,6 +2968,7 @@ def _sparse_attn_decode_partial_kernel(
         acc_rope,
         mask=head_mask[:, None],
     )
+
 
 
 @triton.jit
@@ -4297,7 +4329,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             NUM_SPLITS=num_splits,
             NUM_STAGES=1,
-            num_warps=4,
+            num_warps=8,
         )
 
     fuse_inv_rope = inv_rope_positions is not None
