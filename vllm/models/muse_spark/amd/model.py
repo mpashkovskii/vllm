@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import ignore_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -68,6 +69,7 @@ from vllm.transformers_utils.configs.muse_spark import (
     MuseSparkDSparkConfig,
     MuseSparkTextConfig,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .muse_moe_runner import (
     MuseMoERunner,
@@ -137,8 +139,52 @@ def norm_residual_then_norm(
     return pre_norm(new_stream, out_dtype=out_dtype), new_stream
 
 
+@functools.cache
+def _tuned_hipblaslt_gemm(m: int, n: int, k: int) -> bool:
+    """True when the AITER bf16 table has a hipBLASLt row for this exact shape.
+
+    Only hipBLASLt rows are honoured: the asm split-K rows accumulate in BF16
+    (see MuseSpark1xMoE), hipBLASLt solutions accumulate in FP32.
+    """
+    from aiter import dtypes
+    from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config
+
+    config = get_GEMM_A16W16_tuned_config(
+        m, n, k, False, str(dtypes.bf16), str(dtypes.bf16), False, False
+    )
+    return config is not None and config["libtype"] == "hipblaslt"
+
+
+def _muse_tuned_linear_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if (
+        x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and _tuned_hipblaslt_gemm(x.shape[0], weight.shape[0], weight.shape[1])
+    ):
+        from aiter.tuned_gemm import tgemm
+
+        return tgemm.mm(x, weight, None)
+    return F.linear(x, weight)
+
+
+def _muse_tuned_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="muse_spark_tuned_linear",
+    op_func=_muse_tuned_linear_impl,
+    fake_impl=_muse_tuned_linear_fake,
+)
+
+
 class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
-    """Run Muse Spark's compression projections through PyTorch linear."""
+    """Run Muse Spark's compression projections through PyTorch linear.
+
+    Shapes with a tuned hipBLASLt row in the AITER table (MI350P, decode
+    batches) use it; everything else is F.linear.
+    """
 
     def apply(
         self,
@@ -146,6 +192,8 @@ class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if bias is None and rocm_aiter_ops.is_tgemm_enabled():
+            return torch.ops.vllm.muse_spark_tuned_linear(x, layer.weight)
         return F.linear(x, layer.weight, bias)
 
 
