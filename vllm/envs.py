@@ -335,6 +335,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE: bool = True
     VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN: bool = True
+    VLLM_ROCM_GEMMA4_FUSED_PLE: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS: int = 1024
     VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
@@ -2281,6 +2282,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in three row-wise Triton kernels
     "VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN": lambda: bool(
         int(os.getenv("VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN", "1"))
+    ),
+    # Gemma4 per-layer-input branch: gelu*mul in the epilogue of the gate GEMM (Triton) and a
+    # Triton projection GEMM at small token counts
+    "VLLM_ROCM_GEMMA4_FUSED_PLE": lambda: bool(
+        int(os.getenv("VLLM_ROCM_GEMMA4_FUSED_PLE", "1"))
     ),
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
