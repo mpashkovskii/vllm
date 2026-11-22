@@ -334,6 +334,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE: bool = True
+    VLLM_ROCM_GEMMA4_KV4_LAYERS: str = ""
+    VLLM_ROCM_GEMMA4_KV4_K_SCALE: float = 0.035
+    VLLM_ROCM_GEMMA4_KV4_V_SCALE: float = 0.5
     VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN: bool = True
     VLLM_ROCM_GEMMA4_FUSED_PLE: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP: bool = True
@@ -2283,6 +2286,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8 KV cache): q/k/v RMSNorm + RoPE + FP8 q quant + FP8 KV cache write
     "VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE": lambda: bool(
         int(os.getenv("VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE", "1"))
+    ),
+    # Gemma4, ROCm unified attention with an fp8 KV cache: comma-separated indices of the
+    # large-head (global) KV-owning layers whose KV cache is stored as 4-bit e2m1 with the static
+    # per-tensor scales below (layers sharing their cache follow). Empty: all layers fp8.
+    "VLLM_ROCM_GEMMA4_KV4_LAYERS": lambda: os.getenv("VLLM_ROCM_GEMMA4_KV4_LAYERS", ""),
+    "VLLM_ROCM_GEMMA4_KV4_K_SCALE": lambda: float(
+        os.getenv("VLLM_ROCM_GEMMA4_KV4_K_SCALE", "0.035")
+    ),
+    "VLLM_ROCM_GEMMA4_KV4_V_SCALE": lambda: float(
+        os.getenv("VLLM_ROCM_GEMMA4_KV4_V_SCALE", "0.5")
     ),
     # Gemma4 decoder-layer residual / RMSNorm chain (post-attn norm + add + pre-FF norm
     # (+ FP8 quant), post-FF norm + add, PLE norm + add + layer scalar + next input norm)
