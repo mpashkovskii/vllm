@@ -234,6 +234,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
         rocm_segmented_attn_autotune_warmup(worker)
 
+        from vllm.v1.attention.backends.rocm_aiter_fa import (
+            warmup_short_extend_attention,
+        )
+
+        warmup_short_extend_attention(worker.vllm_config)
+
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
     step5_dsa_warmup(worker)

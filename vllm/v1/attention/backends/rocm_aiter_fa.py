@@ -1381,6 +1381,67 @@ class AiterFlashAttentionImpl(AttentionImpl):
             sinks=self.sinks,
         )
 
+    def warmup_short_extend(
+        self,
+        layer: torch.nn.Module,
+        max_q: int,
+        max_blocks_per_req: int,
+        max_tokens: int,
+    ) -> int:
+        """Run the in-place short-extend kernel once per Triton variant.
+
+        Reads the layer's real KV cache (the kernel never writes it) through a
+        dummy block table, so no device memory is held after the call.
+        Returns the number of launches.
+        """
+        key_cache, value_cache = self._split_kv_cache(layer.kv_cache)
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            key_cache = key_cache.view(current_platform.fp8_dtype())
+            value_cache = value_cache.view(current_platform.fp8_dtype())
+        num_blocks, block_size = key_cache.shape[0], key_cache.shape[1]
+        device = key_cache.device
+        max_ctx = max_blocks_per_req * block_size - max_q
+        launches = 0
+        for num_reqs in (1, 2, 3, 4, 8, 16, 32, 64):
+            for q in (2, 4, 8, 16, max_q):
+                if q > max_q or num_reqs * q > max_tokens:
+                    continue
+                query = torch.zeros(
+                    (num_reqs * q, self.num_heads, self.head_size),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                out = torch.empty_like(query)
+                qsl = torch.arange(
+                    0, (num_reqs + 1) * q, q, dtype=torch.int32, device=device
+                )
+                block_table = torch.zeros(
+                    (num_reqs, max_blocks_per_req), dtype=torch.int32, device=device
+                )
+                block_table[:, : min(max_blocks_per_req, num_blocks)] = torch.arange(
+                    min(max_blocks_per_req, num_blocks),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for ctx in (500, 4096, 20000, max_ctx):
+                    seq_len = min(ctx, max_ctx) + q
+                    seq_lens = torch.full(
+                        (num_reqs,), seq_len, dtype=torch.int32, device=device
+                    )
+                    md = AiterFlashAttentionDecodeMetadata(
+                        max_query_len=1,
+                        num_short_extends=num_reqs,
+                        short_max_query_len=q,
+                        short_max_seq_len=seq_len,
+                        short_query_start_loc=qsl,
+                        short_seq_lens=seq_lens,
+                        short_block_table=block_table,
+                    )
+                    self._short_extend_forward(layer, md, query, key_cache, value_cache, out)
+                    launches += 1
+        torch.accelerator.synchronize()
+        return launches
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -1958,3 +2019,55 @@ class AiterFlashAttentionImpl(AttentionImpl):
             flash_layout,
             is_fp8_kv_cache,
         )
+
+
+def warmup_short_extend_attention(vllm_config: VllmConfig) -> None:
+    """Compile the Triton unified_attention variants the short-extend path
+    launches (2d for sliding layers, 3d for full layers, several split
+    counts) at start-up, so no request pays the JIT or the cache load."""
+    import time
+
+    max_q = int(os.environ.get("VLLM_ROCM_AITER_FA_SHORT_EXTEND_MAX_Q", "0"))
+    if max_q <= 1 or os.environ.get("VLLM_ROCM_AITER_FA_SHORT_EXTEND_WARMUP", "1") == "0":
+        return
+    seen: set = set()
+    start = time.perf_counter()
+    launches = 0
+    try:
+        for layer in get_layers_from_vllm_config(vllm_config, Attention).values():
+            impl = layer.impl
+            kv_cache = getattr(layer, "kv_cache", None)
+            if (
+                not isinstance(impl, AiterFlashAttentionImpl)
+                or not isinstance(kv_cache, torch.Tensor)
+                or kv_cache.dim() != 4
+            ):
+                continue
+            key = (
+                impl.sliding_window,
+                impl.sinks is not None,
+                impl.num_heads,
+                impl.head_size,
+                kv_cache.shape[1:],
+                kv_cache.dtype,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            block_size = kv_cache.shape[2]
+            launches += impl.warmup_short_extend(
+                layer,
+                max_q,
+                cdiv(vllm_config.model_config.max_model_len, block_size),
+                vllm_config.scheduler_config.max_num_batched_tokens,
+            )
+    except Exception:
+        logger.warning("Short-extend attention warm-up failed", exc_info=True)
+        return
+    logger.info(
+        "ROCM_AITER_FA: warmed up short-extend unified_attention "
+        "(%d layer configs, %d launches) in %.1f s",
+        len(seen),
+        launches,
+        time.perf_counter() - start,
+    )
