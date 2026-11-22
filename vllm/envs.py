@@ -338,6 +338,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_GEMMA4_FUSED_PLE: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS: int = 1024
+    VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS: int = 136
     VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
     VLLM_ROCM_UNIFIED_ATTN_HD256_TRITON_PREFILL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
@@ -2268,6 +2269,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Smallest token count that takes the fused MX MLP path.
     "VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS", "1024")
+    ),
+    # Smallest token count (up to 256) that takes the decode-size fused MX MLP (128 x 160-hidden
+    # gate_up tiles with the GeLU*up + MX quant epilogue, MX down); 0 disables it and its extra
+    # weight copy.
+    "VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS", "136")
     ),
     "VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT": lambda: bool(
         int(os.getenv("VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT", "1"))
