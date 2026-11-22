@@ -189,8 +189,7 @@ def _flydsl_ptpc_gemm_fake(
 _MX_GATE_UP = (20480, 2560)  # merged gate/up of Gemma-4-E4B
 _MX_DOWN = (2560, 10240)
 _MX_UNIT_SCALES: dict[tuple, torch.Tensor] = {}
-# decode-size (136..256 tokens) MX down: batched mxscale kernel config (tile 128x160x128, 4-way split K, B straight to registers)
-_DEC_DOWN = "flydsl_bmm_mxfp8_mfma_t128x160x128_w2x2_nb3_sk4_bd2_xcd"
+
 
 
 def _mx_unit_scale(device: torch.device, n: int, k: int) -> torch.Tensor:
@@ -224,13 +223,13 @@ def _flydsl_gelu_mlp_mx_impl(
     dec_min = envs.VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS
     if dec_min and dec_min <= m <= 256 and w1_il_dec.numel() > 0:
         from aiter.ops.flydsl.gemm_a8w8_gelu_mx import flydsl_gate_up_gelu_mx_dec
-        from aiter.ops.flydsl.gemm_mxfp8_down_chan import flydsl_mx_down_decode
+        from aiter.ops.flydsl.gemm_mxfp8_down_ws import flydsl_mx_down_ws
 
-        act = torch.empty((m, inter), dtype=x_q.dtype, device=x_q.device)
+        act = torch.empty((-(-m // 16) * 16 * inter,), dtype=x_q.dtype, device=x_q.device)
         act_sc = torch.empty(-(-m // 256) * 256 * (inter // 32), dtype=torch.uint8, device=x_q.device)
         flydsl_gate_up_gelu_mx_dec(x_q, w1_il_dec, x_s, w1_s_il_dec, act, act_sc)
         out = torch.empty((m, w2_shuffled.shape[0]), dtype=torch.bfloat16, device=x_q.device)
-        flydsl_mx_down_decode(act, act_sc, w2_shuffled, w2_unit, w2_s.reshape(-1), out, _DEC_DOWN)
+        flydsl_mx_down_ws(act, act_sc, w2_shuffled, w2_s.reshape(-1), out)
         return out
     if m >= envs.VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS:
         from aiter.ops.flydsl.gemm_a8w8_gelu_mx import (
