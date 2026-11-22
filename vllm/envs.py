@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP8BMM: bool = False
     VLLM_ROCM_USE_AITER_FP4BMM: bool = False
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
+    VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY: bool = True
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1452,6 +1453,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
+        in ("true", "1")
+    ),
+    # With an FP8 KV cache, quantize the query to FP8 too in the AITER unified
+    # attention backend (FP8 QK and PV dots). Set to 0 to keep the query in the
+    # model dtype: the kernel dequantizes K and V in registers, which keeps the
+    # attention's error at that of the cache's rounding.
+    "VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY": lambda: (
+        os.getenv("VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY", "True").lower()
         in ("true", "1")
     ),
     # Whether to use aiter fusion shared experts ops.
