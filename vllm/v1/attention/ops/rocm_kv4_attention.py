@@ -48,8 +48,10 @@ def _kv4_decode_3d(
     HEAD_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     NUM_SEGMENTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     HALF: tl.constexpr = HEAD_SIZE // 2
+    TILES_PER_BLOCK: tl.constexpr = BLOCK_SIZE // TILE_SIZE
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
@@ -83,9 +85,10 @@ def _kv4_decode_3d(
     n_full = seq_len // TILE_SIZE
     k_t = offs_t[:, None] * sk1 + offs_j[None, :]
     for j in range(seg_lo, min(seg_hi, n_full)):
-        pb = tl.load(block_tables_ptr + bt_off + j).to(tl.int64)
-        kb = kc_ptr + pb * sk0 + kv_head_idx * sk2
-        vb = vc_ptr + pb * sv0 + kv_head_idx * sv2
+        pb = tl.load(block_tables_ptr + bt_off + j // TILES_PER_BLOCK).to(tl.int64)
+        t0 = (j % TILES_PER_BLOCK) * TILE_SIZE * sk1
+        kb = kc_ptr + pb * sk0 + kv_head_idx * sk2 + t0
+        vb = vc_ptr + pb * sv0 + kv_head_idx * sv2 + t0
         Kb = tl.trans(tl.load(kb + k_t, cache_modifier=".cg"))
         S = qk_scale * tl.dot_scaled(Q, None, "e4m3", Kb, None, "e2m1")
         S = tl.where(qmask[:, None], S, float("-inf"))
@@ -106,9 +109,10 @@ def _kv4_decode_3d(
     if seg_hi > n_full and seg_lo <= n_full:
         seq_offset = n_full * TILE_SIZE + offs_t
         tile_mask = seq_offset < seq_len
-        pb = tl.load(block_tables_ptr + bt_off + n_full).to(tl.int64)
-        kb = kc_ptr + pb * sk0 + kv_head_idx * sk2
-        vb = vc_ptr + pb * sv0 + kv_head_idx * sv2
+        pb = tl.load(block_tables_ptr + bt_off + n_full // TILES_PER_BLOCK).to(tl.int64)
+        t0 = (n_full % TILES_PER_BLOCK) * TILE_SIZE * sk1
+        kb = kc_ptr + pb * sk0 + kv_head_idx * sk2 + t0
+        vb = vc_ptr + pb * sv0 + kv_head_idx * sv2 + t0
         Kb = tl.trans(tl.load(kb + k_t, mask=tile_mask[:, None], other=0, cache_modifier=".cg"))
         S = qk_scale * tl.dot_scaled(Q, None, "e4m3", Kb, None, "e2m1")
         S = tl.where(qmask[:, None] & tile_mask[None, :], S, float("-inf"))
@@ -154,6 +158,9 @@ def scale_tensor(value: float, device) -> torch.Tensor:
     return t
 
 
+TILE = 64
+
+
 def _pick_num_segments(num_seqs: int, num_kv_heads: int) -> int:
     n = -(-2048 // max(1, num_seqs * num_kv_heads))
     n = 1 << max(0, (n - 1).bit_length())
@@ -184,7 +191,7 @@ def kv4_decode_attention(
     ns, nq, hd = q.shape
     nkv = key_cache.shape[2]
     bs = key_cache.shape[1]
-    assert bs == 64 and hd == 512, (bs, hd)
+    assert bs % TILE == 0 and hd == 512, (bs, hd)
     assert key_cache.stride(3) == 1 and value_cache.stride(3) == 1
     assert key_cache.stride(1) == value_cache.stride(1)
     nseg = num_segments or _pick_num_segments(ns, nkv)
@@ -213,10 +220,11 @@ def kv4_decode_attention(
         value_cache.stride(2),
         nq,
         nq // nkv,
-        bs,
+        TILE,
         hd,
         16,
         nseg,
+        bs,
         num_warps=2,
         waves_per_eu=2,
         num_stages=1,
@@ -240,7 +248,7 @@ def kv4_decode_attention(
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=None,
         NUM_SEGMENTS_PER_SEQ=nseg,
-        TILE_SIZE=bs,
+        TILE_SIZE=TILE,
         enable_fp_fusion=True,
         num_warps=4,
         waves_per_eu=2,
@@ -270,18 +278,21 @@ def _kv4_dequant_blocks(
     d1: tl.int64,
     d2: tl.constexpr,
     MAXB: tl.constexpr,
-    BS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     HALF: tl.constexpr,
 ):
+    # scratch blocks hold 64 tokens; the source block holds BLOCK_SIZE (a multiple of 64)
+    SB: tl.constexpr = 64
     seq = tl.program_id(0)
     b = tl.program_id(1)
     h = tl.program_id(2)
-    if b * BS >= tl.load(seqlen_ptr + seq):
+    if b * SB >= tl.load(seqlen_ptr + seq):
         return
-    pb = tl.load(bt_ptr + seq * bt_stride + b).to(tl.int64)
-    offs_t = tl.arange(0, BS)
+    pb = tl.load(bt_ptr + seq * bt_stride + (b * SB) // BLOCK_SIZE).to(tl.int64)
+    offs_t = tl.arange(0, SB)
     offs_j = tl.arange(0, HALF)
-    src = src_ptr + pb * s0 + h * s1 + offs_t[:, None] * s2 + offs_j[None, :]
+    tok = (b * SB) % BLOCK_SIZE + offs_t
+    src = src_ptr + pb * s0 + h * s1 + tok[:, None] * s2 + offs_j[None, :]
     dst = dst_ptr + (seq * MAXB + b).to(tl.int64) * d0 + h * d1 + offs_t[:, None] * d2 + offs_j[None, :]
     for part in range(2):  # K then V
         x = tl.load(src + part * HALF).to(tl.int32)
@@ -295,20 +306,22 @@ def kv4_dequant_to_fp8(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     seqused_k: torch.Tensor,
-    max_blocks: int,
+    max_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Dequantise the blocks of the given sequences into an fp8 scratch pool.
+    """Dequantise the blocks of the given sequences into an fp8 scratch pool of 64-token blocks.
 
     kv_cache: the layer's [B, H, bs, D] uint8 cache (D bytes = K row + V row of D / 2 each, D = head_size).
-    Returns (key, value, block_table) in the regular fp8 layout [N, bs, H, head_size] with the
-    scaled-down e2m1 values (e2m1 * k_scale / v_scale is applied by the kernels' descales).
+    Returns (key, value, block_table) in the regular fp8 layout [N, 64, H, head_size] holding the raw
+    e2m1 values (the kernels' k/v descales apply the static scales).
     """
     nb_total, nkv, bs, c = kv_cache.shape
     ns = seqused_k.shape[0]
     half = c // 2
     hd = c
+    sb = 64
+    max_blocks = -(-max_seq_len // sb)
     fp8 = current_platform.fp8_dtype()
-    scratch = torch.empty((ns * max_blocks, nkv, bs, 2 * hd), dtype=torch.uint8, device=kv_cache.device)
+    scratch = torch.empty((ns * max_blocks, nkv, sb, 2 * hd), dtype=torch.uint8, device=kv_cache.device)
     _kv4_dequant_blocks[(ns, max_blocks, nkv)](
         kv_cache,
         scratch,

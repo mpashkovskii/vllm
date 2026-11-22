@@ -295,8 +295,9 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             cu_prefill = attn_metadata.prefill_query_start_loc
         else:
             cu_prefill = cu
-        max_blocks = min(-(-attn_metadata.max_seq_len // cache.shape[2]), block_table.shape[1])
-        k, v, bt = kv4_dequant_to_fp8(cache, block_table[nd:], seqused_k[nd:], max_blocks)
+        k, v, bt = kv4_dequant_to_fp8(
+            cache, block_table[nd:], seqused_k[nd:], attn_metadata.max_seq_len
+        )
         self.unified_attention(
             q=query[ndt:n],
             k=k,
