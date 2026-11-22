@@ -360,6 +360,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # Under dual-batch overlap the TP group's collectives are issued from
+        # both ubatch threads; the custom all-reduce families below (QuickReduce,
+        # AITER cross-device, CUDA custom-AR, symm-mem) all share one workspace
+        # pool per communicator and are unsafe for two concurrent calls, so
+        # inside a DBO context always take the NCCL path.
+        from vllm.v1.worker.ubatching import dbo_enabled
+
+        if dbo_enabled():
+            pynccl_comm = self.pynccl_comm
+            if pynccl_comm is None or pynccl_comm.disabled:
+                out = input_.clone()
+                torch.distributed.all_reduce(out, group=self.device_group)
+                return out
+            out = pynccl_comm.all_reduce(input_)
+            if out is None:
+                out = input_.clone()
+                torch.distributed.all_reduce(out, group=self.device_group)
+            return out
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
