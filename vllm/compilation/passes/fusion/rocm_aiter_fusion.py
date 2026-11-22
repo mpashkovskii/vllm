@@ -65,6 +65,13 @@ class AiterRMSNormQuantPattern:
     def empty_f32(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         return torch.empty(*args, dtype=torch.float32, device=self.device, **kwargs)
 
+    @staticmethod
+    def weight_like(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # GemmaRMSNorm (Qwen3.5, Gemma) normalizes with an fp32 `1 + w` weight.
+        # The AITER fused RMSNorm + quant kernels read the weight in the input's
+        # dtype and return NaN for an fp32 one, so cast it.
+        return weight.to(input.dtype)
+
 
 class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
     """AITER RMSNorm + Dynamic Quantization pattern."""
@@ -102,7 +109,7 @@ class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             result = self.FUSED_OP(
                 x=input,
-                weight=weight,
+                weight=self.weight_like(input, weight),
                 epsilon=self.epsilon,
                 quant_dtype=self.quant_dtype,
             )
@@ -159,7 +166,7 @@ class AiterFusedAddRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
             result = self.FUSED_OP(
                 x=input,
                 residual=residual,
-                weight=weight,
+                weight=self.weight_like(input, weight),
                 epsilon=self.epsilon,
                 quant_dtype=self.quant_dtype,
             )
@@ -602,7 +609,7 @@ class AiterRMSNormStaticQuantPattern(AiterRMSNormQuantPattern):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             result = self.FUSED_OP(
                 x=input,
-                weight=weight,
+                weight=self.weight_like(input, weight),
                 epsilon=self.epsilon,
                 scale=scale,
                 quant_dtype=self.quant_dtype,
@@ -671,7 +678,7 @@ class AiterFusedAddRMSNormStaticQuantPattern(AiterRMSNormQuantPattern):
             result = self.FUSED_OP(
                 x=input,
                 residual=residual,
-                weight=weight,
+                weight=self.weight_like(input, weight),
                 epsilon=self.epsilon,
                 scale=scale,
                 quant_dtype=self.quant_dtype,
