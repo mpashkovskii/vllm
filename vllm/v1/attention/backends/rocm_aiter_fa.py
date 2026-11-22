@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import itertools
 import os
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
@@ -1423,11 +1424,19 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     dtype=torch.int32,
                     device=device,
                 )
-                for ctx in (500, 4096, 20000, max_ctx):
+                for ctx, misaligned in itertools.product(
+                    (500, 4096, 20000, max_ctx), (0, 1)
+                ):
                     seq_len = min(ctx, max_ctx) + q
+                    # In serving, seq_lens is a slice that starts after the
+                    # pure decodes: Triton specializes the pointer on 16-byte
+                    # alignment, so warm both alignments.
                     seq_lens = torch.full(
-                        (num_reqs,), seq_len, dtype=torch.int32, device=device
-                    )
+                        (num_reqs + misaligned,),
+                        seq_len,
+                        dtype=torch.int32,
+                        device=device,
+                    )[misaligned:]
                     md = AiterFlashAttentionDecodeMetadata(
                         max_query_len=1,
                         num_short_extends=num_reqs,
