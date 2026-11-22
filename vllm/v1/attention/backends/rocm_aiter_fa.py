@@ -541,7 +541,7 @@ class AiterFlashAttentionMetadataBuilder(
                 num_window_blocks, dtype=torch.int64, device=device
             )
 
-        if self.short_extend_max_q > 1 and kv_sharing_shape is None:
+        if self.short_extend_max_q > 1:
             self.reorder_batch_threshold = self.short_extend_max_q
             logger.info_once(
                 "ROCM_AITER_FA: short-query extends (<= %d new tokens) use "
