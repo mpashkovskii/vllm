@@ -7,6 +7,7 @@ from typing import ClassVar
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm._aiter_ops import IS_AITER_FOUND, rocm_aiter_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
@@ -196,8 +197,12 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         from vllm.platforms.rocm import on_gfx11
 
         self.unified_attention = unified_attention
-        # RDNA3 has no low precision MMA, preserve query precision
-        self.supports_quant_query_input = not on_gfx11()
+        # RDNA3 has no low precision MMA, preserve query precision; elsewhere an
+        # FP8 KV cache quantizes the query too unless
+        # VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY=0
+        self.supports_quant_query_input = (
+            not on_gfx11() and envs.VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY
+        )
 
         # Layout flag: must mirror get_kv_cache_shape, which is attn_type
         # agnostic because the allocation is shared across layers.
