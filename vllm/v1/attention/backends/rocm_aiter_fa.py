@@ -551,6 +551,10 @@ class AiterFlashAttentionMetadataBuilder(
         else:
             self.short_extend_max_q = 0
 
+        self._extend_stats: dict | None = None
+        if os.environ.get("VLLM_ROCM_AITER_FA_EXTEND_STATS", "0") == "1":
+            self._extend_stats = {"builds": 0, "req": {}, "tok": {}, "step": {}}
+
         self.extend_workspace = torch.empty(
             [2, _CP_TOKENS_PER_ITER_ROCM, self.num_heads_kv, self.headdim],
             dtype=self.model_config.dtype,
@@ -568,6 +572,42 @@ class AiterFlashAttentionMetadataBuilder(
                 ),
                 dtype=self.model_config.dtype,
                 device=device,
+            )
+
+    _STAT_EDGES = (1, 8, 16, 32, 48, 64, 96, 128, 256, 512, 1 << 30)
+
+    def _record_extend_stats(self, md: CommonAttentionMetadata) -> None:
+        st = self._extend_stats
+        assert st is not None
+        qsl = md.query_start_loc_cpu
+        q = (qsl[1:] - qsl[:-1]).tolist()
+        seq = md.seq_lens_cpu_upper_bound
+        seq = seq.tolist() if seq is not None else [0] * len(q)
+        small_tok = 0
+        for ql, sl in zip(q, seq):
+            kind = "dec" if ql == 1 else ("pre" if sl == ql else "ext")
+            if kind == "dec":
+                key = "dec"
+            else:
+                key = next(
+                    f"{kind}<={e}" for e in self._STAT_EDGES if ql <= e
+                )
+            st["req"][key] = st["req"].get(key, 0) + 1
+            st["tok"][key] = st["tok"].get(key, 0) + ql
+            if kind == "ext" and ql <= 64:
+                small_tok += ql
+        sk = next(
+            f"<={e}" for e in (0, 32, 64, 128, 256, 512, 1 << 30) if small_tok <= e
+        )
+        st["step"][sk] = st["step"].get(sk, 0) + 1
+        st["builds"] += 1
+        if st["builds"] % 400 == 0:
+            logger.info(
+                "EXTEND_STATS builds=%d req=%s tok=%s step_small_ext_tokens=%s",
+                st["builds"],
+                dict(sorted(st["req"].items())),
+                dict(sorted(st["tok"].items())),
+                dict(sorted(st["step"].items())),
             )
 
     def _build_swa_decode_tables(
@@ -651,6 +691,8 @@ class AiterFlashAttentionMetadataBuilder(
         fast_build: bool = False,
     ) -> "AiterFlashAttentionMetadata":
         assert self.reorder_batch_threshold is not None
+        if self._extend_stats is not None:
+            self._record_extend_stats(common_attn_metadata)
         split_ret = split_decodes_prefills_and_extends(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold,
