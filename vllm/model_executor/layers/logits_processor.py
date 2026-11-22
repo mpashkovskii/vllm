@@ -54,6 +54,22 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return impl(scores, k, sorted=True, deterministic=True)
 
 
+# Non-empty while the caller wants the final-logit soft cap left to it: element 0 then
+# receives the cap the logits still need (None when the model has none).
+_soft_cap_deferral: list[float | None] = []
+
+
+def begin_soft_cap_deferral() -> None:
+    _soft_cap_deferral[:] = [None]
+
+
+def end_soft_cap_deferral() -> float | None:
+    """The soft cap the logits computed since `begin_soft_cap_deferral` still need."""
+    cap = _soft_cap_deferral[0] if _soft_cap_deferral else None
+    _soft_cap_deferral.clear()
+    return cap
+
+
 # --8<-- [start:logits_processor]
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
@@ -111,7 +127,10 @@ class LogitsProcessor(PluggableLayer):
                 hidden_states, lm_head, embedding_bias, skip_gather
             )
         if logits is not None:
-            if self.soft_cap is not None:
+            if self.soft_cap is not None and self.scale == 1.0 and _soft_cap_deferral:
+                # The caller applies the cap itself (to the few survivors of a top-k).
+                _soft_cap_deferral[0] = self.soft_cap
+            elif self.soft_cap is not None:
                 capped = self._fused_soft_cap(logits)
                 if capped is None:
                     logits = logits / self.soft_cap

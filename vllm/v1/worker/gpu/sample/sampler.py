@@ -145,11 +145,27 @@ class Sampler:
         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
         return num_logprobs, max_token_ids
 
+    def can_defer_soft_cap(self, input_batch: InputBatch) -> bool:
+        """Whether the batch is served by the bounded top-k path, which can take logits
+        without the model's final soft cap and cap only the survivors."""
+        if not (self.use_bounded_topk and envs.VLLM_ROCM_BOUNDED_TOPK_SELECTOR_BF16):
+            return False
+        idx_mapping_np = input_batch.idx_mapping_np
+        return (
+            input_batch.num_reqs > 0
+            and not self.compute_nans
+            and self.get_logprobs_dims(idx_mapping_np) is None
+            and self._bounded_top_k(idx_mapping_np, False) is not None
+        )
+
     def __call__(
         self,
         logits: torch.Tensor,
         input_batch: InputBatch,
+        soft_cap: float | None = None,
     ) -> SamplerOutput:
+        """`soft_cap`: the final-logit soft cap `logits` have not been given yet; only
+        a batch for which `can_defer_soft_cap` holds may pass one."""
         expanded_idx_mapping = input_batch.expanded_idx_mapping
         idx_mapping = input_batch.idx_mapping
         idx_mapping_np = input_batch.idx_mapping_np
@@ -175,6 +191,7 @@ class Sampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
             return_logprobs=logprobs_dims is not None,
+            soft_cap=soft_cap,
         )
 
         if self.trace_replay_state is not None:
@@ -316,8 +333,14 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
+        soft_cap: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         max_top_k = self._bounded_top_k(idx_mapping_np, return_logprobs)
+        if soft_cap is not None and max_top_k is None:
+            from vllm.model_executor.layers.fusion.logit_softcap import eager_soft_cap
+
+            logits = eager_soft_cap(logits, soft_cap)
+            soft_cap = None
         if max_top_k is not None:
             states = self.sampling_states
             do_top_p = bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
@@ -331,6 +354,7 @@ class Sampler:
                 states.seeds.gpu,
                 pos,
                 use_fp64=self.use_fp64_gumbel,
+                soft_cap=soft_cap,
             )
             return sampled, logits
         processed_logits = self.apply_sampling_params(

@@ -13,8 +13,17 @@ for the same support set.
 
 import torch
 
+from vllm import envs
+from vllm.model_executor.layers.fusion.logit_softcap import (
+    _SMALL_T,
+    _TL_DTYPES,
+    eager_soft_cap,
+    softcap_exact,
+    softcap_f32,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
+from vllm.v1.worker.gpu.sample.topk_bf16 import topk_bf16_select, topk_bf16_supported
 
 # Largest per-request top_k the bounded path serves. Selection cost grows with
 # k, and beyond this the stock full-vocab kernel is competitive.
@@ -34,10 +43,15 @@ def _bounded_topk_sample_kernel(
     temp_ptr,
     seeds_ptr,
     pos_ptr,
+    inv_cap,
+    cap,
     KMAX: tl.constexpr,
     KBLOCK: tl.constexpr,
     USE_TOP_P: tl.constexpr,
     USE_FP64: tl.constexpr,
+    SOFT_CAP: tl.constexpr,
+    IN_DTYPE: tl.constexpr,
+    SMALL_T: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     req = tl.load(expanded_idx_mapping_ptr + row).to(tl.int64)
@@ -50,6 +64,8 @@ def _bounded_topk_sample_kernel(
         logits_ptr + row * logits_stride + ids, mask=in_range, other=float("-inf")
     )
     vals = vals.to(tl.float32)
+    if SOFT_CAP:
+        vals = softcap_f32(vals, inv_cap, cap, IN_DTYPE, SMALL_T)
 
     # The selector returns the KMAX best columns in no particular order; a
     # request with top_k < KMAX keeps only the top_k best of them (ties broken
@@ -122,14 +138,34 @@ def bounded_topk_sample(
     seeds: torch.Tensor,  # [max_num_reqs]
     pos: torch.Tensor,  # [num_tokens]
     use_fp64: bool = False,
+    soft_cap: float | None = None,  # `logits` still need tanh(x / cap) * cap
 ) -> torch.Tensor:
     from aiter.ops.topk_select import topk_select
 
     num_tokens = logits.shape[0]
     if logits.stride(-1) != 1:
         logits = logits.contiguous()
-    select_in = logits if logits.dtype == torch.float32 else logits.float()
-    _, idx = topk_select(select_in, max_top_k)
+    if (
+        soft_cap is not None
+        and envs.VLLM_ROCM_BOUNDED_TOPK_SELECTOR_BF16
+        and topk_bf16_supported(logits, max_top_k)
+        and softcap_exact(soft_cap, logits.dtype, logits.device)
+    ):
+        # The cap is monotone, so the raw logits' top-k is a top-k of the capped
+        # ones (ties after rounding may pick other tied tokens): select on the
+        # raw 16-bit logits and cap the survivors only.
+        idx = topk_bf16_select(logits, max_top_k)
+    else:
+        if soft_cap is not None:
+            logits = eager_soft_cap(logits, soft_cap)
+            soft_cap = None
+        if envs.VLLM_ROCM_BOUNDED_TOPK_SELECTOR_BF16 and topk_bf16_supported(
+            logits, max_top_k
+        ):
+            idx = topk_bf16_select(logits, max_top_k)
+        else:
+            select_in = logits if logits.dtype == torch.float32 else logits.float()
+            _, idx = topk_select(select_in, max_top_k)
     sampled = torch.empty(num_tokens, dtype=torch.int64, device=logits.device)
     _bounded_topk_sample_kernel[(num_tokens,)](
         sampled,
@@ -143,9 +179,14 @@ def bounded_topk_sample(
         temperature,
         seeds,
         pos,
+        1.0 / soft_cap if soft_cap is not None else 1.0,
+        soft_cap if soft_cap is not None else 1.0,
         KMAX=max_top_k,
         KBLOCK=triton.next_power_of_2(max_top_k),
         USE_TOP_P=top_p is not None,
         USE_FP64=use_fp64,
+        SOFT_CAP=soft_cap is not None,
+        IN_DTYPE=_TL_DTYPES.get(logits.dtype, tl.bfloat16),
+        SMALL_T=_SMALL_T,
     )
     return sampled

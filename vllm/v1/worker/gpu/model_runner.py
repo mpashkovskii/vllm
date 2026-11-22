@@ -44,6 +44,10 @@ from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.logits_processor import (
+    begin_soft_cap_deferral,
+    end_soft_cap_deferral,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1638,6 +1642,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
+        soft_cap = None
         if self.batch_sharder is not None:
             # Shard the inputs along the batch dimension to sample in parallel
             # across TP ranks.
@@ -1653,7 +1658,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            defer_soft_cap = (
+                grammar_output is None
+                and input_batch.num_draft_tokens == 0
+                and type(self.sampler) is Sampler
+                and self.sampler.can_defer_soft_cap(input_batch)
+            )
+            if defer_soft_cap:
+                begin_soft_cap_deferral()
             logits = self.model.compute_logits(sample_hidden_states)
+            if defer_soft_cap:
+                soft_cap = end_soft_cap_deferral()
 
         invalid_drafts = None
         # A diffusion prefill has no logit rows even when a bitmask row
@@ -1680,7 +1695,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampler_output = None
         elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
+            sampler_output = self.sampler(logits, input_batch, soft_cap=soft_cap)
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None

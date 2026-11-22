@@ -34,6 +34,23 @@ def _rcp(v):
 
 
 @triton.jit
+def softcap_f32(x, inv_cap, cap, IN_DTYPE: tl.constexpr, SMALL_T: tl.constexpr):
+    """The eager chain's three roundings on an fp32 view of 16-bit values; fp32 result."""
+    t = (x * inv_cap).to(IN_DTYPE).to(tl.float32)
+    a = tl.abs(t)
+    e = tl.exp2(a * -_LOG2E_X2)
+    r = (1.0 - e) * _rcp(1.0 + e)
+    r = tl.where(a < SMALL_T, a, r)
+    r = tl.where(a > 10.0, 1.0, r)
+    r = (
+        r.to(tl.int32, bitcast=True)
+        | (t.to(tl.int32, bitcast=True) & -2147483648)
+    ).to(tl.float32, bitcast=True)
+    u = r.to(IN_DTYPE).to(tl.float32)
+    return (u * cap).to(IN_DTYPE).to(tl.float32)
+
+
+@triton.jit
 def _softcap_kernel(
     x_ptr,
     y_ptr,
@@ -47,18 +64,7 @@ def _softcap_kernel(
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    t = (x * inv_cap).to(IN_DTYPE).to(tl.float32)
-    a = tl.abs(t)
-    e = tl.exp2(a * -_LOG2E_X2)
-    r = (1.0 - e) * _rcp(1.0 + e)
-    r = tl.where(a < SMALL_T, a, r)
-    r = tl.where(a > 10.0, 1.0, r)
-    r = (
-        r.to(tl.int32, bitcast=True)
-        | (t.to(tl.int32, bitcast=True) & -2147483648)
-    ).to(tl.float32, bitcast=True)
-    u = r.to(IN_DTYPE).to(tl.float32)
-    y = (u * cap).to(IN_DTYPE)
+    y = softcap_f32(x, inv_cap, cap, IN_DTYPE, SMALL_T)
     tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
@@ -103,6 +109,16 @@ def _verified(cap: float, dtype: torch.dtype, device: torch.device) -> bool:
                 dtype,
             )
     return ok
+
+
+def softcap_exact(cap: float, dtype: torch.dtype, device: torch.device) -> bool:
+    """Whether `softcap_f32` reproduces the eager chain bit for bit for this cap and dtype."""
+    return dtype in _TL_DTYPES and _verified(cap, dtype, device)
+
+
+def eager_soft_cap(logits: torch.Tensor, cap: float) -> torch.Tensor:
+    capped = fused_logit_softcap(logits, cap)
+    return capped if capped is not None else torch.tanh(logits / cap) * cap
 
 
 def fused_logit_softcap(
