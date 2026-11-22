@@ -562,7 +562,10 @@ class Gemma4Attention(nn.Module):
 
                 scale_tensor(self.attn.impl.kv4_k_scale, torch.get_default_device())
                 scale_tensor(self.attn.impl.kv4_v_scale, torch.get_default_device())
-            logger.info_once("Gemma4 attention: 4-bit KV cache on global layers %s", sorted(kv4_layers))
+            logger.info_once(
+                "Gemma4 attention: 4-bit KV cache on global layers %s",
+                envs.VLLM_ROCM_GEMMA4_KV4_LAYERS,
+            )
         if self._fused_glue:
             logger.info_once(
                 "Gemma4 attention: fused qkv norm + RoPE + FP8 quant + KV cache "
