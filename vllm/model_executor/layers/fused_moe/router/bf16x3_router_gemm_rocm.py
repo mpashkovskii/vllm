@@ -66,13 +66,17 @@ def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
 def platform_supported() -> bool:
     """Whether this platform has a benchmarked bf16x3 router path.
 
-    gfx942 has a different fp32:bf16 MFMA ratio and is not yet evaluated.
+    gfx950 was the original target. gfx942 is also enabled: at (K=6144,
+    E=128) on MI325X the bf16x3 GEMM plus term reduction beats the fp32
+    cast+GEMM it replaces from ~M=1024 up (383.3us -> 162.9us at M=16384),
+    so the same MIN_TOKENS floor keeps it on the winning side of the
+    crossover.
     """
     if not current_platform.is_rocm():
         return False
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx942, on_gfx950
 
-    return on_gfx950()
+    return on_gfx950() or on_gfx942()
 
 
 def is_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:

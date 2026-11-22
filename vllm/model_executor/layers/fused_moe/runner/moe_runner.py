@@ -779,17 +779,33 @@ class MoERunner(MoERunnerInterface):
             shared_output, fused_output_is_reduced
         )
 
-        shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
-            shared_output, fused_output
-        )
-
-        # Apply output transform (e.g. latent -> full dim)
-        fused_output = self.apply_routed_output_transform(fused_output)
-
-        if shared_output is not None:
-            result = shared_output + fused_output
+        if (
+            shared_output is not None
+            and self.routed_scaling_factor != 1.0
+            and fused_output.dtype != torch.float16
+            and self.routed_output_transform is None
+        ):
+            # Fold the routed-scale multiply into the shared+routed add:
+            # one elementwise pass (shared + alpha * fused) instead of two
+            # (fused_ *= alpha; shared + fused). ATen computes the alpha-add
+            # in fp32 opmath like the two-op sequence it replaces.
+            result = torch.add(
+                shared_output, fused_output, alpha=self.routed_scaling_factor
+            )
         else:
-            result = fused_output
+            shared_output, fused_output = (
+                self._maybe_apply_routed_scale_to_output(
+                    shared_output, fused_output
+                )
+            )
+
+            # Apply output transform (e.g. latent -> full dim)
+            fused_output = self.apply_routed_output_transform(fused_output)
+
+            if shared_output is not None:
+                result = shared_output + fused_output
+            else:
+                result = fused_output
 
         result = self._maybe_reduce_final_output(
             result, og_hidden_dim_post_xform, fused_output_is_reduced
