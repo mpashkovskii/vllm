@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import os
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
@@ -334,6 +335,15 @@ class AiterFlashAttentionDecodeMetadata:
     swa_block_table: torch.Tensor | None = None
     swa_seq_lens: torch.Tensor | None = None
     swa_max_seq_len: int = 0
+    # Short-query extends (2..N new tokens on cached context) that follow the
+    # single-token decodes inside the decode group; read in place by one
+    # unified_attention call instead of gather + FMHA. 0 when not split.
+    num_short_extends: int = 0
+    short_max_query_len: int = 0
+    short_max_seq_len: int = 0
+    short_query_start_loc: torch.Tensor | None = None
+    short_seq_lens: torch.Tensor | None = None
+    short_block_table: torch.Tensor | None = None
 
 
 @dataclass
@@ -482,6 +492,11 @@ class AiterFlashAttentionMetadataBuilder(
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self.short_extend_max_q = 0
+        if self.reorder_batch_threshold == 1:
+            self.short_extend_max_q = int(
+                os.environ.get("VLLM_ROCM_AITER_FA_SHORT_EXTEND_MAX_Q", "0")
+            )
 
         sliding_window_configs: set[tuple[int, int] | None] = set()
         kv_sharing_shape = None
@@ -525,6 +540,16 @@ class AiterFlashAttentionMetadataBuilder(
             self._swa_block_offsets = torch.arange(
                 num_window_blocks, dtype=torch.int64, device=device
             )
+
+        if self.short_extend_max_q > 1:
+            self.reorder_batch_threshold = self.short_extend_max_q
+            logger.info_once(
+                "ROCM_AITER_FA: short-query extends (<= %d new tokens) use "
+                "in-place unified_attention",
+                self.short_extend_max_q,
+            )
+        else:
+            self.short_extend_max_q = 0
 
         self.extend_workspace = torch.empty(
             [2, _CP_TOKENS_PER_ITER_ROCM, self.num_heads_kv, self.headdim],
@@ -672,14 +697,48 @@ class AiterFlashAttentionMetadataBuilder(
 
         decode_metadata = None
         if num_decodes > 0:
-            decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+            decode_group_query_lens = query_lens_cpu[:num_decodes]
+            decode_max_query_len = decode_group_query_lens.max().item()
             swa_block_table, swa_seq_lens, swa_max_seq_len = None, None, 0
-            if decode_max_query_len == 1:
+            num_short_extends = 0
+            short_kwargs = {}
+            num_pure_decodes = num_decodes
+            if self.short_extend_max_q > 0 and decode_max_query_len > 1:
+                # The reorder puts the single-token decodes first and the
+                # short extends after them.
+                num_pure_decodes = (
+                    (decode_group_query_lens > 1).int().argmax(dim=-1).item()
+                )
+                num_short_extends = num_decodes - num_pure_decodes
+                short_qsl = common_attn_metadata.query_start_loc[
+                    num_pure_decodes : num_decodes + 1
+                ]
+                short_seq_upper = common_attn_metadata.seq_lens_cpu_upper_bound
+                short_kwargs = dict(
+                    num_short_extends=num_short_extends,
+                    short_max_query_len=decode_max_query_len,
+                    short_max_seq_len=short_seq_upper[
+                        num_pure_decodes:num_decodes
+                    ]
+                    .max()
+                    .item()
+                    if short_seq_upper is not None
+                    else common_attn_metadata.max_seq_len,
+                    short_query_start_loc=short_qsl - short_qsl[0],
+                    short_seq_lens=common_attn_metadata.seq_lens[
+                        num_pure_decodes:num_decodes
+                    ],
+                    short_block_table=common_attn_metadata.block_table_tensor[
+                        num_pure_decodes:num_decodes
+                    ],
+                )
+                decode_max_query_len = 1
+            if decode_max_query_len == 1 and num_pure_decodes > 0:
                 swa_block_table, swa_seq_lens, swa_max_seq_len = (
                     self._build_swa_decode_tables(
                         common_attn_metadata.block_table_tensor,
                         common_attn_metadata.seq_lens,
-                        num_decodes,
+                        num_pure_decodes,
                         common_attn_metadata.max_seq_len,
                     )
                 )
@@ -688,6 +747,7 @@ class AiterFlashAttentionMetadataBuilder(
                 swa_block_table=swa_block_table,
                 swa_seq_lens=swa_seq_lens,
                 swa_max_seq_len=swa_max_seq_len,
+                **short_kwargs,
             )
 
         prefill_metadata = None
@@ -1241,6 +1301,44 @@ class AiterFlashAttentionImpl(AttentionImpl):
             suffix_lse=lse,
         )
 
+    def _short_extend_forward(
+        self,
+        layer: torch.nn.Module,
+        decode_md: AiterFlashAttentionDecodeMetadata,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        from aiter.ops.triton.unified_attention import unified_attention
+
+        assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
+            "Short-query in-place extend does not support the shuffle KV cache layout."
+        )
+        k_descale, v_descale = self._get_kv_cache_descales(
+            layer, decode_md.num_short_extends
+        )
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=decode_md.short_query_start_loc,
+            max_seqlen_q=decode_md.short_max_query_len,
+            seqused_k=decode_md.short_seq_lens,
+            max_seqlen_k=decode_md.short_max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            window_size=self.sliding_window,
+            block_table=decode_md.short_block_table,
+            softcap=self.logits_soft_cap,
+            q_descale=None,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=self.sinks,
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -1408,6 +1506,22 @@ class AiterFlashAttentionImpl(AttentionImpl):
         if num_decodes > 0:
             assert attn_metadata.decode_metadata is not None
             decode_max_query_len = attn_metadata.decode_metadata.max_query_len
+            num_short_extends = attn_metadata.decode_metadata.num_short_extends
+            if num_short_extends > 0:
+                # Short-query extends sit after the single-token decodes: read
+                # the cached context in place (no gather, no merge).
+                self._short_extend_forward(
+                    layer,
+                    attn_metadata.decode_metadata,
+                    query[num_decodes - num_short_extends : num_decode_tokens],
+                    key_cache,
+                    value_cache,
+                    output[num_decodes - num_short_extends : num_decode_tokens],
+                )
+                num_decodes -= num_short_extends
+                num_decode_tokens = num_decodes
+                if num_decodes == 0:
+                    return output
 
             # Use unified_attention for the decodes the paged kernels can't
             # take: sliding window, sinks, or a multi-token batch
