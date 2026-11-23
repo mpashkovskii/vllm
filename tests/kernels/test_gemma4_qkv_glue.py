@@ -83,3 +83,36 @@ def test_qkv_glue(head_dim: int, rot_pairs: int, write_kv: bool, num_tokens: int
     untouched[slots[ok]] = False
     idx = torch.arange(nblocks * bs, device=dev)[untouched]
     assert not kc[idx // bs, idx % bs].view(torch.uint8).any()
+
+
+@pytest.mark.parametrize("head_dim,rot_pairs", [(256, 128), (512, 64)])
+@pytest.mark.parametrize("kv4", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 37, 300])
+def test_qkv_glue_kv_only(head_dim: int, rot_pairs: int, kv4: bool, num_tokens: int):
+    """The K/V-only pass over the [k | v] projection writes the same cache bytes as the full one."""
+    torch.manual_seed(0)
+    dev, bs, fp8 = "cuda", 64, current_platform.fp8_dtype()
+    qkv = (torch.randn(num_tokens, (NQ + 2 * NKV) * head_dim, device=dev) * 3).to(torch.bfloat16)
+    pos = torch.randint(0, 4096, (num_tokens,), device=dev)
+    cos_sin = torch.randn(4096, head_dim, device=dev).to(torch.bfloat16)
+    q_w = (torch.randn(head_dim, device=dev) * 0.5 + 1).to(torch.bfloat16)
+    k_w = (torch.randn(head_dim, device=dev) * 0.5 + 1).to(torch.bfloat16)
+    scales = [torch.tensor(s, device=dev) for s in (0.5, 1.0, 2.0)]
+    nblocks = num_tokens // bs + 3
+    last = head_dim // 2 if kv4 else head_dim
+    slots = torch.randperm(nblocks * bs, device=dev)[:num_tokens]
+    slots[::5] = -1
+    caches = []
+    for kv_only in (False, True):
+        kv = torch.zeros(nblocks, NKV, bs, 2 * last, dtype=torch.uint8, device=dev)
+        kc, vc = kv.transpose(1, 2).split(last, dim=-1)
+        if not kv4:
+            kc, vc = kc.view(fp8), vc.view(fp8)
+        out = qkv_glue(
+            qkv[:, NQ * head_dim :].contiguous() if kv_only else qkv,
+            pos, cos_sin, q_w, k_w, *scales, kc, vc, slots, NQ, NKV, head_dim, rot_pairs, EPS,
+            kv4=kv4, kv_only=kv_only,
+        )  # fmt: skip
+        assert out.numel() == 1 or not kv_only
+        caches.append(kv.clone())
+    assert torch.equal(caches[0], caches[1])
