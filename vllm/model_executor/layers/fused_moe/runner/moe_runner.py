@@ -35,6 +35,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts import (
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
+from vllm.model_executor.layers.fused_moe.router.router_chain_control import (
+    router_chain_fastpath_enabled,
+)
 from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter,
 )
@@ -784,6 +787,7 @@ class MoERunner(MoERunnerInterface):
             and self.routed_scaling_factor != 1.0
             and fused_output.dtype != torch.float16
             and self.routed_output_transform is None
+            and router_chain_fastpath_enabled()
         ):
             # Fold the routed-scale multiply into the shared+routed add:
             # one elementwise pass (shared + alpha * fused) instead of two
