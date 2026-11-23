@@ -610,22 +610,33 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             w1_scale.view(torch.uint8), kg, n_pad, "W1 scale"
         )
 
-        # De-interleave gate/up from the padded pairwise-semantic storage rows
-        # into the separated composite [gate | up] over the true inter. The
-        # exact row mapping is a backend property (pairwise rows, padded
-        # halves, compact halves): find it empirically on the real storage --
-        # _flydsl_g1_mapping returns the mapping whose mxfp4 values are
-        # reproduced bit-exactly by the cache, else raises.
-        mapping = self._flydsl_g1_mapping(w_kn, s_kn, inter_true, hidden, kg)
+        # De-interleave gate/up from the padded storage rows into the
+        # separated composite [gate | up] over the true inter. The row mapping
+        # is a backend property: the default is "halves" (the layout the
+        # AMD mono loader documents for the plain w13: gate rows [0, inter),
+        # up rows [n_pad/2, n_pad/2 + inter), zero padding in between), and
+        # VLLM_FLYDSL_A8W4_G1_MAP overrides it. The first layer dumps the
+        # storage slices to /tmp/iter17_w13_dump.pt so a wrong mapping can be
+        # identified offline (against the checkpoint) without another server
+        # cycle; the verify below fails loudly at load on a wrong mapping.
+        mapping = os.environ.get("VLLM_FLYDSL_A8W4_G1_MAP", "halves")
         if mapping == "pairwise":
             g_idx = torch.arange(0, 2 * inter_true, 2, device=w_kn.device)
             u_idx = g_idx + 1
         elif mapping == "halves":
             g_idx = torch.arange(inter_true, device=w_kn.device)
-            u_idx = g_idx + (n_pad // 2)
-        else:  # compact: gate [0, inter_true), up [inter_true, 2*inter_true)
+            u_idx = g_idx + n_pad // 2
+        elif mapping == "compact":
             g_idx = torch.arange(inter_true, device=w_kn.device)
             u_idx = g_idx + inter_true
+        else:
+            raise RuntimeError(
+                f"VLLM_FLYDSL_A8W4_G1_MAP must be pairwise|halves|compact,"
+                f" got {mapping!r}"
+            )
+        AiterW4A16ExpertsMonolithic._flydsl_g1_dump_once(
+            w_kn, s_kn, inter_true, n_pad, hidden
+        )
         gate = w_kn.index_select(2, g_idx)
         up = w_kn.index_select(2, u_idx)
         w1_sem = torch.cat([gate, up], dim=2).transpose(1, 2).contiguous()
@@ -633,6 +644,10 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         su = s_kn.index_select(2, u_idx)
         s1_sem = torch.cat([sg, su], dim=2).contiguous()  # (E, Kg, 1152)
         w8, s_w = requant_w2_to_fp8col(w1_sem, s1_sem, hidden, pair_k0=True)
+
+        self._flydsl_g1_verify(
+            w_kn, s_kn, g_idx, u_idx, w8, s_w, inter_true, hidden
+        )
 
         self._flydsl_g1_w8 = w8
         self._flydsl_g1_sw = s_w
@@ -650,16 +665,51 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             tuple(w8.shape),
         )
 
+    _flydsl_g1_dumped: bool = False
+
+    @classmethod
+    def _flydsl_g1_dump_once(cls, w_kn, s_kn, inter_true, n_pad, hidden):
+        """Snapshot the real W1 storage slices (first layer only) for offline
+        layout analysis against the checkpoint."""
+        if cls._flydsl_g1_dumped:
+            return
+        cls._flydsl_g1_dumped = True
+        try:
+            dump = {
+                "w_kn": w_kn[:16].contiguous().cpu(),
+                "s_kn": s_kn[:16].contiguous().cpu(),
+                "w_kn_shape": tuple(w_kn.shape),
+                "s_kn_shape": tuple(s_kn.shape),
+                "w_kn_strides": tuple(w_kn.stride()),
+                "s_kn_strides": tuple(s_kn.stride()),
+                "w_kn_dtype": str(w_kn.dtype),
+                "s_kn_dtype": str(s_kn.dtype),
+                "inter_true": inter_true,
+                "n_pad": n_pad,
+                "hidden": hidden,
+            }
+            torch.save(dump, "/tmp/iter17_w13_dump.pt")
+            logger.info(
+                "VLLM_FLYDSL_A8W4_G1: dumped W1 storage slices to"
+                " /tmp/iter17_w13_dump.pt: w_kn%s strides%s, s_kn%s strides%s",
+                dump["w_kn_shape"],
+                dump["w_kn_strides"],
+                dump["s_kn_shape"],
+                dump["s_kn_strides"],
+            )
+        except Exception:
+            logger.exception("VLLM_FLYDSL_A8W4_G1 dump failed")
+
     @staticmethod
-    def _flydsl_g1_verify(w_kn, s_kn, w8, s_w, inter_true, hidden, kg, n=8192):
+    def _flydsl_g1_verify(w_kn, s_kn, g_idx, u_idx, w8, s_w, inter_true, hidden, n=8192):
         """Ground-truth the fp8 cache against the production W1 storage.
 
-        The triton path's validated N semantic is pairwise: storage row 2j =
-        gate_j, row 2j+1 = up_j. Under that mapping, the cache must satisfy
-        w8[e, col, k] * s_w[e, col] == mxfp4(e, row, k) exactly (both sides are
-        powers-of-two-scaled e2m1 values, exact in fp32). A wrong
-        de-interleave (or scale orientation) fails this check loudly at load,
-        not as a GSM8K regression an hour later.
+        ``g_idx``/``u_idx`` are the chosen row mapping (storage rows of
+        gate_j/up_j). The cache must satisfy w8[e, col, k] * s_w[e, col] ==
+        mxfp4(e, storage_row, k) exactly (both sides are powers-of-two-scaled
+        e2m1 values, exact in fp32). A wrong de-interleave (or scale
+        orientation) fails this check loudly at load, not as a GSM8K
+        regression an hour later.
         """
         dev = w8.device
         E_ = w8.shape[0]
@@ -668,7 +718,7 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         j = torch.randint(inter_true, (n,), device=dev, generator=gen)
         k = torch.randint(hidden, (n,), device=dev, generator=gen)
         up_sel = torch.randint(2, (n,), device=dev, generator=gen)
-        row = 2 * j + up_sel  # pairwise storage row
+        row = torch.where(up_sel == 0, g_idx[j], u_idx[j])
         col = j + up_sel * inter_true  # cache column (gate first, then up)
         grp = k // 32
         byte = w_kn[e, k // 2, row].to(torch.int32)
@@ -692,35 +742,11 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             n,
             float(ref.abs().max()),
         )
-        if diff >= 1e-6:
-            # Dump the real storage slices for offline layout analysis
-            # (identifying the backend's row mapping without more server
-            # cycles), then fail loudly.
-            try:
-                dump = {
-                    "w_kn": w_kn[:16].contiguous().cpu(),
-                    "s_kn": s_kn[:16].contiguous().cpu(),
-                    "w_kn_shape": tuple(w_kn.shape),
-                    "s_kn_shape": tuple(s_kn.shape),
-                    "w_kn_strides": tuple(w_kn.stride()),
-                    "s_kn_strides": tuple(s_kn.stride()),
-                    "w_kn_dtype": str(w_kn.dtype),
-                    "s_kn_dtype": str(s_kn.dtype),
-                    "inter_true": inter_true,
-                    "n_pad": 2 * (s_kn.shape[2] // 2),
-                    "hidden": hidden,
-                }
-                torch.save(dump, "/tmp/iter17_w13_dump.pt")
-                logger.info(
-                    "VLLM_FLYDSL_A8W4_G1: dumped W1 storage slice to"
-                    " /tmp/iter17_w13_dump.pt"
-                )
-            except Exception:
-                logger.exception("VLLM_FLYDSL_A8W4_G1 dump failed")
         assert diff < 1e-6, (
             "a8w4 G1 fp8 cache does not reproduce the production mxfp4 W1"
-            " values under the pairwise mapping (max diff %.3e) -- the W1"
-            " storage layout assumption is wrong for this backend" % diff
+            " values (max diff %.3e; storage dumps in /tmp/iter17_w13_dump.pt)"
+            " -- set VLLM_FLYDSL_A8W4_G1_MAP to the layout the offline"
+            " analysis of the dump identifies" % diff
         )
 
     @staticmethod
