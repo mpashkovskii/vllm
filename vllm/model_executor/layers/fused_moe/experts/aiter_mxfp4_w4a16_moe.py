@@ -610,18 +610,29 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             w1_scale.view(torch.uint8), kg, n_pad, "W1 scale"
         )
 
-        # De-interleave the pairwise rows [g0, u0, g1, u1, ...] into the
-        # separated composite [gate | up] over the true inter: the first
-        # 2*inter_true pairwise rows hold the real values, the rest is padding.
-        gate = w_kn[:, :, : 2 * inter_true : 2]  # (E, Kpack, inter_true)
-        up = w_kn[:, :, 1 : 2 * inter_true : 2]
+        # De-interleave gate/up from the padded pairwise-semantic storage rows
+        # into the separated composite [gate | up] over the true inter. The
+        # exact row mapping is a backend property (pairwise rows, padded
+        # halves, compact halves): find it empirically on the real storage --
+        # _flydsl_g1_mapping returns the mapping whose mxfp4 values are
+        # reproduced bit-exactly by the cache, else raises.
+        mapping = self._flydsl_g1_mapping(w_kn, s_kn, inter_true, hidden, kg)
+        if mapping == "pairwise":
+            g_idx = torch.arange(0, 2 * inter_true, 2, device=w_kn.device)
+            u_idx = g_idx + 1
+        elif mapping == "halves":
+            g_idx = torch.arange(inter_true, device=w_kn.device)
+            u_idx = g_idx + (n_pad // 2)
+        else:  # compact: gate [0, inter_true), up [inter_true, 2*inter_true)
+            g_idx = torch.arange(inter_true, device=w_kn.device)
+            u_idx = g_idx + inter_true
+        gate = w_kn.index_select(2, g_idx)
+        up = w_kn.index_select(2, u_idx)
         w1_sem = torch.cat([gate, up], dim=2).transpose(1, 2).contiguous()
-        sg = s_kn[:, :, : 2 * inter_true : 2]
-        su = s_kn[:, :, 1 : 2 * inter_true : 2]
+        sg = s_kn.index_select(2, g_idx)
+        su = s_kn.index_select(2, u_idx)
         s1_sem = torch.cat([sg, su], dim=2).contiguous()  # (E, Kg, 1152)
         w8, s_w = requant_w2_to_fp8col(w1_sem, s1_sem, hidden, pair_k0=True)
-
-        self._flydsl_g1_verify(w_kn, s_kn, w8, s_w, inter_true, hidden, kg)
 
         self._flydsl_g1_w8 = w8
         self._flydsl_g1_sw = s_w
@@ -681,6 +692,31 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             n,
             float(ref.abs().max()),
         )
+        if diff >= 1e-6:
+            # Dump the real storage slices for offline layout analysis
+            # (identifying the backend's row mapping without more server
+            # cycles), then fail loudly.
+            try:
+                dump = {
+                    "w_kn": w_kn[:16].contiguous().cpu(),
+                    "s_kn": s_kn[:16].contiguous().cpu(),
+                    "w_kn_shape": tuple(w_kn.shape),
+                    "s_kn_shape": tuple(s_kn.shape),
+                    "w_kn_strides": tuple(w_kn.stride()),
+                    "s_kn_strides": tuple(s_kn.stride()),
+                    "w_kn_dtype": str(w_kn.dtype),
+                    "s_kn_dtype": str(s_kn.dtype),
+                    "inter_true": inter_true,
+                    "n_pad": 2 * (s_kn.shape[2] // 2),
+                    "hidden": hidden,
+                }
+                torch.save(dump, "/tmp/iter17_w13_dump.pt")
+                logger.info(
+                    "VLLM_FLYDSL_A8W4_G1: dumped W1 storage slice to"
+                    " /tmp/iter17_w13_dump.pt"
+                )
+            except Exception:
+                logger.exception("VLLM_FLYDSL_A8W4_G1 dump failed")
         assert diff < 1e-6, (
             "a8w4 G1 fp8 cache does not reproduce the production mxfp4 W1"
             " values under the pairwise mapping (max diff %.3e) -- the W1"
