@@ -422,8 +422,13 @@ def rocm_bf16x3_router_gemm_dispatch_impl(
     from vllm.model_executor.layers.fused_moe.router import (
         bf16x3_router_gemm_rocm,
     )
+    from vllm.model_executor.layers.fused_moe.router.router_chain_control import (  # noqa: E501
+        router_chain_fastpath_enabled,
+    )
 
-    if bf16x3_router_gemm_rocm.is_supported(x, weight):
+    if router_chain_fastpath_enabled() and bf16x3_router_gemm_rocm.is_supported(
+        x, weight
+    ):
         return bf16x3_router_gemm_rocm.bf16x3_router_gemm(x, weight_split)
     # Below MIN_TOKENS, hand back to the low-M gfx950 kernel this tier is
     # checked ahead of.
