@@ -128,12 +128,16 @@ def _qkv_glue_kernel(
     RKV: tl.constexpr,
     WRITE_KV: tl.constexpr,
     KV4: tl.constexpr,
+    HAS_Q: tl.constexpr,
 ):
     HALF: tl.constexpr = HD // 2
     NQP: tl.constexpr = NQ // RQ
     NKP: tl.constexpr = NKV // RKV
+    # HAS_Q False: x holds only [k | v] rows (the K/V projection of a KV-only pass)
+    QP: tl.constexpr = NQP if HAS_Q else 0
+    QOFF: tl.constexpr = NQ * HD if HAS_Q else 0
     if WRITE_KV:
-        NP: tl.constexpr = NQP + 2 * NKP
+        NP: tl.constexpr = QP + 2 * NKP
     else:
         NP: tl.constexpr = NQP
     pid = tl.program_id(0).to(tl.int64)
@@ -145,7 +149,7 @@ def _qkv_glue_kernel(
     fp8_ty: tl.constexpr = qo_ptr.dtype.element_ty
     x_row = x_ptr + t * stride_x
 
-    if part < NQP:
+    if HAS_Q and part < NQP:
         rbq = tl.arange(0, RQ)
         row_off = (part * RQ + rbq) * HD
         n1, n2 = _norm_rope_rows(x_row, row_off, qw_ptr, cs_row, eps, offs, HALF, ROT, True, True)
@@ -160,10 +164,10 @@ def _qkv_glue_kernel(
             if slot >= 0:
                 blk = slot // block_size
                 off = slot % block_size
-                if part < NQP + NKP:
-                    h = (part - NQP) * RKV + rbk
+                if part < QP + NKP:
+                    h = (part - QP) * RKV + rbk
                     n1, n2 = _norm_rope_rows(
-                        x_row, NQ * HD + h * HD, kw_ptr, cs_row, eps, offs, HALF, ROT, True, True
+                        x_row, QOFF + h * HD, kw_ptr, cs_row, eps, offs, HALF, ROT, True, True
                     )
                     ks = tl.load(ks_ptr)
                     o = kc_ptr + blk * stride_kb + off * stride_ks + h[:, None] * stride_kh + offs[None, :]
@@ -173,9 +177,9 @@ def _qkv_glue_kernel(
                         tl.store(o, _fp8(n1, ks, FP8_MAX, fp8_ty))
                         tl.store(o + HALF, _fp8(n2, ks, FP8_MAX, fp8_ty))
                 else:
-                    h = (part - NQP - NKP) * RKV + rbk
+                    h = (part - QP - NKP) * RKV + rbk
                     n1, n2 = _norm_rope_rows(
-                        x_row, (NQ + NKV) * HD + h * HD, kw_ptr, cs_row, eps, offs, HALF, ROT, False, False
+                        x_row, QOFF + NKV * HD + h * HD, kw_ptr, cs_row, eps, offs, HALF, ROT, False, False
                     )
                     vs = tl.load(vs_ptr)
                     o = vc_ptr + blk * stride_vb + off * stride_vs + h[:, None] * stride_vh + offs[None, :]
@@ -210,19 +214,22 @@ def qkv_glue(
     rq: int | None = None,
     rkv: int | None = None,
     kv4: bool = False,
+    kv_only: bool = False,
 ) -> torch.Tensor:
     rq = rq or num_heads
     rkv = rkv or num_kv_heads
     num_tokens = qkv.shape[0]
     out = torch.empty(
-        (num_tokens, num_heads * head_dim),
+        (1, 1) if kv_only else (num_tokens, num_heads * head_dim),
         dtype=current_platform.fp8_dtype(),
         device=qkv.device,
     )
     if num_tokens == 0:
         return out
     write_kv = key_cache is not None and slot_mapping is not None
-    nparts = num_heads // rq + (2 * (num_kv_heads // rkv) if write_kv else 0)
+    if kv_only and not write_kv:
+        return out
+    nparts = (0 if kv_only else num_heads // rq) + (2 * (num_kv_heads // rkv) if write_kv else 0)
     grid = (num_tokens * nparts,)
     if write_kv:
         strides = (*key_cache.stride()[:3], *value_cache.stride()[:3])
@@ -262,6 +269,7 @@ def qkv_glue(
         RKV=rkv,
         WRITE_KV=write_kv,
         KV4=kv4,
+        HAS_Q=not kv_only,
         num_warps=num_warps,
     )
     return out
@@ -280,6 +288,7 @@ def _gemma4_qkv_glue_impl(
     head_dim: int,
     rot_pairs: int,
     eps: float,
+    kv_only: bool,
 ) -> torch.Tensor:
     from vllm.model_executor.layers.attention.attention import get_attention_context
 
@@ -319,6 +328,7 @@ def _gemma4_qkv_glue_impl(
         rot_pairs,
         eps,
         kv4=kv4,
+        kv_only=kv_only,
     )
 
 
@@ -335,9 +345,10 @@ def _gemma4_qkv_glue_fake(
     head_dim: int,
     rot_pairs: int,
     eps: float,
+    kv_only: bool,
 ) -> torch.Tensor:
     return torch.empty(
-        (qkv.shape[0], num_heads * head_dim),
+        (1, 1) if kv_only else (qkv.shape[0], num_heads * head_dim),
         dtype=current_platform.fp8_dtype(),
         device=qkv.device,
     )
@@ -364,8 +375,10 @@ def gemma4_qkv_glue(
     head_dim: int,
     rot_pairs: int,
     eps: float,
+    kv_only: bool = False,
 ) -> torch.Tensor:
-    """Returns the FP8 query; the FP8 k/v of write_kv layers land in the cache."""
+    """Returns the FP8 query; the FP8 k/v of write_kv layers land in the cache. kv_only: qkv
+    holds only the [k | v] projection; writes the cache and returns a dummy dependency tensor."""
     return torch.ops.vllm.gemma4_qkv_glue(
         qkv,
         positions,
@@ -379,4 +392,5 @@ def gemma4_qkv_glue(
         head_dim,
         rot_pairs,
         eps,
+        kv_only,
     )

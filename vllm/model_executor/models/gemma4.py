@@ -546,6 +546,10 @@ class Gemma4Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
         self._fused_glue = self._can_fuse_qkv_glue()
+        # Fast prefill split inside the last self-decoder layer: the self-decoder only
+        # writes this layer's K/V (forward_kv_only), the cross-decoder runs its Q/attention/
+        # o_proj on the sampled rows (tail_only).
+        self.tail_only = False
         self.kv4 = False
         kv4_layers = {int(i) for i in envs.VLLM_ROCM_GEMMA4_KV4_LAYERS.split(",") if i.strip()}
         if kv4_layers and not self.is_sliding and kv_owner_layer_idx in kv4_layers:
@@ -604,6 +608,27 @@ class Gemma4Attention(nn.Module):
             and (self.num_kv_heads & (self.num_kv_heads - 1)) == 0
         )
 
+    def forward_kv_only(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """K/V projection, norm, RoPE and cache write only; returns a dummy dependency."""
+        kv = _linear_rows(self.qkv_proj, hidden_states, self.q_size, 2 * self.kv_size)
+        return gemma4_qkv_glue(
+            kv,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.attn.layer_name,
+            True,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self._rot_pairs,
+            self.config.rms_norm_eps,
+            True,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -613,6 +638,9 @@ class Gemma4Attention(nn.Module):
         if self._fused_glue:
             if self.is_kv_shared_layer:
                 x, _ = self.q_proj(hidden_states)
+                k_weight = self.q_norm.weight
+            elif self.tail_only:
+                x = _linear_rows(self.qkv_proj, hidden_states, 0, self.q_size)
                 k_weight = self.q_norm.weight
             else:
                 x, _ = self.qkv_proj(hidden_states)
@@ -624,7 +652,7 @@ class Gemma4Attention(nn.Module):
                 self.q_norm.weight,
                 k_weight,
                 self.attn.layer_name,
-                not self.is_kv_shared_layer,
+                not (self.is_kv_shared_layer or self.tail_only),
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -986,12 +1014,19 @@ class Gemma4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
+def _linear_rows(
+    proj: nn.Module, x: torch.Tensor, row_start: int, num_rows: int
+) -> torch.Tensor:
+    """x @ W[row_start : row_start + num_rows]^T of an unquantized linear layer."""
+    weight = proj.weight[row_start : row_start + num_rows]
+    return proj.quant_method._gemm_impl(proj, x, weight, None)
+
+
 def _ple_model_projection(
     proj: ColumnParallelLinear, x: torch.Tensor, row_start: int, num_rows: int
 ) -> torch.Tensor:
     """x @ W[row_start : row_start + num_rows]^T for a slice of per_layer_model_projection."""
-    weight = proj.weight[row_start : row_start + num_rows]
-    return proj.quant_method._gemm_impl(proj, x, weight, None)
+    return _linear_rows(proj, x, row_start, num_rows)
 
 
 def _run_decoder_layers(
@@ -1001,12 +1036,14 @@ def _run_decoder_layers(
     hidden_states: torch.Tensor,
     per_layer_inputs: torch.Tensor | None = None,
     per_layer_index_start: int | None = None,
+    residual: torch.Tensor | None = None,
+    final_next_norm_weight: torch.Tensor | None = None,
+    return_residual: bool = False,
     **kwargs,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Run a slice of decoder layers with PLE extraction."""
     if per_layer_index_start is None:
         per_layer_index_start = layer_idx_start
-    residual = None
     for idx, layer in enumerate(decoder_layers):
         layer_per_input = (
             per_layer_inputs[:, idx + per_layer_index_start, :]
@@ -1017,7 +1054,7 @@ def _run_decoder_layers(
         next_norm_weight = (
             next_layer.input_layernorm.weight
             if next_layer is not None and next_layer.can_fuse_norm_chain()
-            else None
+            else (final_next_norm_weight if next_layer is None else None)
         )
         hidden_states, residual = layer(
             positions,
@@ -1027,6 +1064,8 @@ def _run_decoder_layers(
             next_input_norm_weight=next_norm_weight,
             **kwargs,
         )
+    if return_residual:
+        return hidden_states, residual
     return hidden_states
 
 
@@ -1061,6 +1100,10 @@ class Gemma4SelfDecoderLayers(nn.Module):
         self.decoder_layers = decoder_layers
         self.layer_idx_start = layer_idx_start
         self.ple_split = ple_split
+        # Layer that only writes its K/V here (its tail runs in the cross-decoder), and the
+        # number of layers whose per-layer inputs this module computes.
+        self.kv_layer: Gemma4DecoderLayer | None = None
+        self.ple_num_layers = len(decoder_layers)
 
         config = _get_text_config(vllm_config.model_config.hf_config)
         self.config = config
@@ -1140,7 +1183,7 @@ class Gemma4SelfDecoderLayers(nn.Module):
         if self.ple_split:
             # Only the self-decoder layers' columns: the cross-decoder computes its own
             # on the sampled positions.
-            num_layers = len(self.decoder_layers)
+            num_layers = self.ple_num_layers
             per_layer_projection = _ple_model_projection(
                 self.per_layer_model_projection,
                 inputs_embeds,
@@ -1180,6 +1223,30 @@ class Gemma4SelfDecoderLayers(nn.Module):
                 hidden_states, per_layer_embeds
             )
 
+        kv_layer = self.kv_layer
+        if kv_layer is not None:
+            assert per_layer_inputs is not None
+            next_norm_weight = (
+                kv_layer.input_layernorm.weight if kv_layer.can_fuse_norm_chain() else None
+            )
+            hidden_states, normed = _run_decoder_layers(
+                self.decoder_layers,
+                self.layer_idx_start,
+                positions,
+                hidden_states,
+                per_layer_inputs,
+                final_next_norm_weight=next_norm_weight,
+                return_residual=True,
+                **kwargs,
+            )
+            if normed is None:
+                normed = kv_layer.input_layernorm(hidden_states)
+            kv_dep = kv_layer.self_attn.forward_kv_only(positions, normed)
+            return (
+                hidden_states,
+                per_layer_inputs[:, len(self.decoder_layers), :],
+                kv_dep,
+            )
         hidden_states = _run_decoder_layers(
             self.decoder_layers,
             self.layer_idx_start,
@@ -1215,6 +1282,9 @@ class Gemma4CrossDecoderLayers(nn.Module):
         self.decoder_layers = decoder_layers
         self.layer_idx_start = layer_idx_start
         self.ple_split = False
+        # Last self-decoder layer whose K/V the self-decoder wrote: this module runs the rest of
+        # it (Q, attention, o_proj, MLP, per-layer input) on the sampled positions.
+        self.tail_layer: Gemma4DecoderLayer | None = None
         config = _get_text_config(vllm_config.model_config.hf_config)
         self.hidden_size_per_layer_input = getattr(
             config, "hidden_size_per_layer_input", 0
@@ -1259,9 +1329,23 @@ class Gemma4CrossDecoderLayers(nn.Module):
         hidden_states: torch.Tensor,
         per_layer_inputs: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        tail_per_layer_input: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         per_layer_index_start = None
+        residual = None
+        if self.tail_layer is not None:
+            first = self.decoder_layers[0]
+            hidden_states, residual = self.tail_layer(
+                positions,
+                hidden_states,
+                None,
+                per_layer_input=tail_per_layer_input,
+                next_input_norm_weight=(
+                    first.input_layernorm.weight if first.can_fuse_norm_chain() else None
+                ),
+                **kwargs,
+            )
         if self.ple_split:
             assert inputs_embeds is not None and per_layer_inputs is not None
             per_layer_inputs = self.project_per_layer_inputs(
@@ -1275,6 +1359,7 @@ class Gemma4CrossDecoderLayers(nn.Module):
             hidden_states,
             per_layer_inputs,
             per_layer_index_start,
+            residual=residual,
             **kwargs,
         )
 
@@ -1443,6 +1528,8 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
 
         self.fast_prefill_enabled = cache_config.kv_sharing_fast_prefill
         self.ple_split = False
+        self.split23 = False
+        self.first_kv_shared_layer_idx = first_kv_shared_layer_idx
 
         if self.fast_prefill_enabled:
             # Allocate static buffers for CUDAGraph
@@ -1528,6 +1615,8 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         self.self_decoder.ple_split = True
         self.cross_decoder.ple_split = True
         self.num_ple_self_layers = len(self.self_decoder.decoder_layers)
+        if envs.VLLM_ROCM_GEMMA4_FAST_PREFILL_SPLIT23:
+            self.enable_split23()
         # raw (embedding-table) per-layer inputs of the cross-decoder layers on the sampled
         # positions, and the token embeddings of those positions (inputs of the projection)
         self.per_layer_inputs = torch.zeros(
@@ -1540,6 +1629,45 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             device=self.hidden_states.device,
         )
         self.cross_inputs_embeds = torch.zeros_like(self.hidden_states)
+        return True
+
+    def enable_split23(self) -> bool:
+        """Move the fast-prefill boundary into the last self-decoder layer: the self-decoder
+        runs it only up to its K/V cache write, the cross-decoder runs its Q projection,
+        attention over the written cache, o_proj, MLP and per-layer input on the sampled rows.
+        Its activations at the other positions are never read."""
+        idx = self.first_kv_shared_layer_idx - 1
+        if not self.ple_split or idx < 0:
+            return False
+        layer = self.layers[idx]
+        attn = layer.self_attn
+        if (
+            attn.is_kv_shared_layer
+            or not attn._fused_glue
+            or attn.attn.kv_sharing_target_layer_name is not None
+            or not isinstance(attn.qkv_proj.quant_method, UnquantizedLinearMethod)
+            or layer.per_layer_input_gate is None
+            or layer.enable_moe_block
+        ):
+            logger.warning(
+                "VLLM_ROCM_GEMMA4_FAST_PREFILL_SPLIT23 ignored: layer %d is not eligible", idx
+            )
+            return False
+        attn.tail_only = True
+        attn.attn.fast_prefill_tail = True
+        self.self_decoder.kv_layer = layer
+        self.self_decoder.decoder_layers = self.layers[:idx]
+        self.cross_decoder.tail_layer = layer
+        self.tail_ple = torch.zeros(
+            (self.positions.shape[0], self.hidden_size_per_layer_input),
+            dtype=self.hidden_states.dtype,
+            device=self.hidden_states.device,
+        )
+        self.split23 = True
+        logger.info_once(
+            "Gemma4 fast prefill: layer %d split (K/V on all tokens, the rest on sampled rows)",
+            idx,
+        )
         return True
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
@@ -1624,13 +1752,23 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                 num_cross_rows,
             )
         self.positions[:batch_size].copy_(positions)
-        self_decoder_hidden_states, per_layer_inputs = self.self_decoder(
-            input_ids=input_ids,
-            positions=self.positions[:batch_size],
-            inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_inputs,
-            **kwargs,
-        )
+        if self.split23:
+            self_decoder_hidden_states, tail_ple, _ = self.self_decoder(
+                input_ids=input_ids,
+                positions=self.positions[:batch_size],
+                inputs_embeds=inputs_embeds,
+                per_layer_inputs=per_layer_inputs,
+                **kwargs,
+            )
+            per_layer_inputs = None
+        else:
+            self_decoder_hidden_states, per_layer_inputs = self.self_decoder(
+                input_ids=input_ids,
+                positions=self.positions[:batch_size],
+                inputs_embeds=inputs_embeds,
+                per_layer_inputs=per_layer_inputs,
+                **kwargs,
+            )
 
         if logits_indices_padded is None:
             logits_indices_padded = torch.arange(
@@ -1648,6 +1786,10 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         self.hidden_states[:num_padded].copy_(
             self_decoder_hidden_states[logits_indices_padded]
         )
+        if self.split23:
+            torch.index_select(
+                tail_ple, 0, logits_indices_padded, out=self.tail_ple[:num_padded]
+            )
         if (
             not self.ple_split
             and self.per_layer_inputs is not None
@@ -1677,6 +1819,11 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
                 self.hidden_states[:num_padded],
                 cross_per_layer,
                 inputs_embeds=self.cross_inputs_embeds[:num_padded],
+                **(
+                    {"tail_per_layer_input": self.tail_ple[:num_padded]}
+                    if self.split23
+                    else {}
+                ),
                 **kwargs,
             )
         else:
