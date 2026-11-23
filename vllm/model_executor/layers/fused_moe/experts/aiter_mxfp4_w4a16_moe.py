@@ -45,6 +45,24 @@ def _flydsl_a8w4_g2_enabled() -> bool:
     return _flydsl_a8w4_g2_cache
 
 
+# iter-17 (DeepSeek-V4.1-Flash uplift): opt-in env flag routing the W4A16
+# GEMM1 (gate+up + clamped silu) through AITER's iter-17 FlyDSL a8w4 kernel:
+# fp8 A (per-token online requant of the hidden states) x W1 requantized once
+# to e4m3fnuz with a per-column exponent shift. Same load-time pattern as
+# iter-14's G2: the W1 -> fp8col requant is built in
+# process_weights_after_loading and the packed mxfp4 W1 is dropped when on.
+_FLYDSL_A8W4_G1_ENV = "VLLM_FLYDSL_A8W4_G1"
+_flydsl_a8w4_g1_cache: bool | None = None
+
+
+def _flydsl_a8w4_g1_enabled() -> bool:
+    global _flydsl_a8w4_g1_cache
+    if _flydsl_a8w4_g1_cache is None:
+        val = os.environ.get(_FLYDSL_A8W4_G1_ENV, "0")
+        _flydsl_a8w4_g1_cache = val.strip().lower() in ("1", "true", "yes", "on")
+    return _flydsl_a8w4_g1_cache
+
+
 def _aiter_w4a16_silu_via_a8w4(
     hidden_states: torch.Tensor,
     w1_data,
@@ -161,6 +179,9 @@ def aiter_triton_kernel_w4a16_moe_forward(
     flydsl_g2_w8: torch.Tensor | None = None,
     flydsl_g2_sw: torch.Tensor | None = None,
     flydsl_g2_k_true: int | None = None,
+    flydsl_g1_w8: torch.Tensor | None = None,
+    flydsl_g1_sw: torch.Tensor | None = None,
+    flydsl_g1_inter: int | None = None,
 ):
     assert quant_config is not None and rocm_aiter_ops.is_enabled()
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -305,28 +326,79 @@ def aiter_triton_kernel_w4a16_moe_forward(
     # used Gluon before this and is unaffected, so leave it on auto-detect.
     a16w4_backend = "triton" if on_gfx950() else None
 
-    intermediate = moe_gemm_a16w4(
-        hidden_states,
-        w1_data,
-        None,
-        w1_wscale,
-        None,
-        None,
-        quant_config.w1_bias,
-        routing_data,
-        gather_indx=gather_idx,
-        gammas=gammas if apply_router_weight_on_input else None,
-        swizzle_mx_scale=swz,
-        apply_swiglu=True,
-        alpha=swiglu_alpha,
-        limit=swiglu_limit,
-        swiglu_add_residual=swiglu_add_residual,
-        unpadded_N=unpadded_N_w1,
-        unpadded_K=unpadded_K_w1,
-        backend=a16w4_backend,
-        expert_map=expert_map,
-        gate_valid=gate_valid,
-    )
+    # iter-17 wire-in (env VLLM_FLYDSL_A8W4_G1): replace the triton GEMM1 with
+    # AITER's iter-17 FlyDSL a8w4 stage-1 kernel. Requires the load-time W1 ->
+    # e4m3fnuz requant cache (flydsl_g1_w8/sw, built in
+    # process_weights_after_loading). Constraints: non-EP path only (same as
+    # iter-14's G2), the SILU activation with its silu_clamp epilog, and
+    # apply_router_weight_on_input == False (the a8w4 G1 gathers the hidden
+    # rows per token -- a per-(token, slot) gamma cannot fold into the
+    # per-token A scale).
+    if (
+        flydsl_g1_w8 is not None
+        and flydsl_g1_sw is not None
+        and flydsl_g1_inter is not None
+        and expert_map is None
+        and gate_valid is None
+        and activation == MoEActivation.SILU
+        and not apply_router_weight_on_input
+    ):
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+            moe_stage1_a8w4_forward,
+        )
+
+        assert routing_data.topk_ids is not None, (
+            "VLLM_FLYDSL_A8W4_G1 requires aiter routing to expose topk_ids"
+        )
+        assert routing_data.gate_scal is not None, (
+            "VLLM_FLYDSL_A8W4_G1 requires aiter routing to expose gate_scal"
+        )
+        num_experts = (
+            global_num_experts
+            if global_num_experts and global_num_experts > 0
+            else routing_data.n_expts_tot
+        )
+        canon_gammas = routing_data.gate_scal.float().index_select(
+            0, scatter_idx.long()
+        )
+        intermediate = moe_stage1_a8w4_forward(
+            hidden_states,
+            routing_data.topk_ids,
+            canon_gammas,
+            scatter_idx,
+            routing_data.gate_scal.numel(),
+            flydsl_g1_w8,
+            flydsl_g1_sw,
+            num_experts=num_experts,
+            inter_dim=flydsl_g1_inter,
+            topk=topk,
+            swiglu_limit=(
+                swiglu_limit if swiglu_limit is not None else float("inf")
+            ),
+        )
+    else:
+        intermediate = moe_gemm_a16w4(
+            hidden_states,
+            w1_data,
+            None,
+            w1_wscale,
+            None,
+            None,
+            quant_config.w1_bias,
+            routing_data,
+            gather_indx=gather_idx,
+            gammas=gammas if apply_router_weight_on_input else None,
+            swizzle_mx_scale=swz,
+            apply_swiglu=True,
+            alpha=swiglu_alpha,
+            limit=swiglu_limit,
+            swiglu_add_residual=swiglu_add_residual,
+            unpadded_N=unpadded_N_w1,
+            unpadded_K=unpadded_K_w1,
+            backend=a16w4_backend,
+            expert_map=expert_map,
+            gate_valid=gate_valid,
+        )
 
     # iter-14 wire-in (env VLLM_FLYDSL_A8W4_G2): replace the triton GEMM2 with
     # AITER's iter-10 FlyDSL a8w4 stage-2 kernel. Requires the load-time W2 ->
@@ -410,6 +482,11 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         self._flydsl_g2_w8: torch.Tensor | None = None
         self._flydsl_g2_sw: torch.Tensor | None = None
         self._flydsl_g2_k_true: int | None = None
+        # iter-17: cached W1 -> e4m3fnuz requant for the FlyDSL a8w4 GEMM1
+        # (filled in process_weights_after_loading when VLLM_FLYDSL_A8W4_G1 on).
+        self._flydsl_g1_w8: torch.Tensor | None = None
+        self._flydsl_g1_sw: torch.Tensor | None = None
+        self._flydsl_g1_inter: int | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """iter-14: build the cached W2 -> fp8 requant for the a8w4 GEMM2.
@@ -456,6 +533,79 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         logger.info(
             "VLLM_FLYDSL_A8W4_G2: cached a8w4 W2 requant (K=%d): %s bytes",
             k_true,
+            tuple(w8.shape),
+        )
+
+        self._process_weights_g1_flydsl(layer, weight_mx_scale)
+
+    def _process_weights_g1_flydsl(self, layer, weight_mx_scale) -> None:
+        """iter-17: build the cached W1 -> fp8 requant for the a8w4 GEMM1.
+
+        Only runs when VLLM_FLYDSL_A8W4_G1 is set: the packed mxfp4 W1
+        storage is dropped after the requant, so a server with the flag on
+        exclusively runs the a8w4 GEMM1 path (server-start A/B switch).
+
+        The production W1 storage is the padded (N=2*inter_padded) *pairwise*
+        gate/up interleave [g0, u0, g1, u1, ...] consumed by the triton path;
+        the a8w4 kernel wants the unpadded separated composite [gate | up]
+        over the true inter (inter_padded - inter_padded % ... unpadded). The
+        real rows sit in the first 2*inter_true pairwise rows: even rows are
+        gate_j, odd rows up_j for j in [0, inter_true).
+        """
+        if not _flydsl_a8w4_g1_enabled():
+            return
+        from vllm.platforms.rocm import on_gfx942
+
+        if not on_gfx942():
+            raise RuntimeError(
+                f"{_FLYDSL_A8W4_G1_ENV} is implemented for gfx942 only"
+            )
+
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+            requant_w2_to_fp8col,
+        )
+
+        mc = self.moe_config
+        inter_true = (
+            mc.intermediate_size_per_partition_unpadded
+            or mc.intermediate_size_per_partition
+        )
+        assert inter_true and inter_true % 32 == 0, (
+            f"bad true inter size {inter_true}"
+        )
+
+        w1_data = layer.w1_weight.storage.data  # uint8 (E, N_pad, K/2), pairwise
+        w1_scale = weight_mx_scale(self.quant_config.w1_precision).storage.data
+        E_, N_pad, Kpack = w1_data.shape
+        assert N_pad // 2 >= inter_true and (N_pad // 2) % 2 == 0, (
+            f"W1 N_pad {N_pad} cannot hold 2*inter_true={2 * inter_true}"
+        )
+        # de-interleave pairwise rows -> separated [gate | up] over true inter
+        wp = w1_data.view(E_, N_pad // 2, 2, Kpack)
+        w1_sem = torch.cat(
+            [wp[:, :inter_true, 0, :], wp[:, :inter_true, 1, :]], dim=1
+        ).contiguous()
+        # scales: physical (E, K_groups, N_pad); de-interleave the N dim
+        sp = w1_scale.view(E_, w1_scale.shape[1], N_pad // 2, 2)
+        s1_sem = torch.cat(
+            [sp[:, :, :inter_true, 0], sp[:, :, :inter_true, 1]], dim=2
+        ).contiguous()
+        w8, s_w = requant_w2_to_fp8col(
+            w1_sem, s1_sem, 2 * w1_sem.shape[2], pair_k0=True
+        )
+        self._flydsl_g1_w8 = w8
+        self._flydsl_g1_sw = s_w
+        self._flydsl_g1_inter = inter_true
+        # Drop the packed mxfp4 W1: with the flag on the triton GEMM1 path is
+        # never dispatched, so its weight storage is dead memory.
+        layer.w1_weight.storage.data = torch.empty(
+            0, dtype=torch.uint8, device=w8.device
+        )
+        logger.info(
+            "VLLM_FLYDSL_A8W4_G1: cached a8w4 W1 requant (inter=%d, K=%d):"
+            " %s bytes",
+            inter_true,
+            2 * Kpack,
             tuple(w8.shape),
         )
 
@@ -583,4 +733,7 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             flydsl_g2_w8=self._flydsl_g2_w8,
             flydsl_g2_sw=self._flydsl_g2_sw,
             flydsl_g2_k_true=self._flydsl_g2_k_true,
+            flydsl_g1_w8=self._flydsl_g1_w8,
+            flydsl_g1_sw=self._flydsl_g1_sw,
+            flydsl_g1_inter=self._flydsl_g1_inter,
         )
