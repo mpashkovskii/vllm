@@ -37,7 +37,10 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.device_communicators import pipelined_ar
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -93,6 +96,11 @@ class MiniMaxM2MoE(nn.Module):
         else:
             self.e_score_correction_bias = None
 
+        # When the pipelined all-reduce is enabled for the decoder layer, the
+        # experts must return the un-reduced (partial) output: the decoupled
+        # all-reduce then runs chunked in the layer's post-MoE op.
+        self.defer_all_reduce = pipelined_ar.master_k() >= 2
+
         self.experts = FusedMoEFactory(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -105,6 +113,7 @@ class MiniMaxM2MoE(nn.Module):
             prefix=f"{prefix}.experts",
             router_logits_dtype=torch.float32,
             ckpt_names=("w1", "w2", "w3"),
+            reduce_results=not self.defer_all_reduce,
         )
 
         self.gate = GateLinear(
@@ -115,18 +124,26 @@ class MiniMaxM2MoE(nn.Module):
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
+        if self.defer_all_reduce:
+            pipelined_ar.register_gate(id(self), self.gate)
+        self.gate_key = id(self)
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight.to(torch.float32))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        if router_logits is None:
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -183,12 +200,18 @@ class MiniMaxM2Attention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
 
+        # With pipelined all-reduce, the o-proj output is returned unreduced;
+        # the decoder layer's post-attn op issues the chunked all-reduce and
+        # consumes it chunk-wise.
+        self.defer_all_reduce = pipelined_ar.master_k() >= 2
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=not self.defer_all_reduce,
         )
 
         if (
@@ -235,8 +258,10 @@ class MiniMaxM2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        qkv: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if qkv is None:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = MiniMaxText01RMSNormTP.forward_qkv(
             self.q_norm, self.k_norm, qkv, self.q_size, self.kv_size
         )
@@ -292,29 +317,82 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Pipelined all-reduce: chunk the two big per-layer TP all-reduces and
+        # consume each chunk (fused add+rmsnorm, router GEMM, qkv GEMM) while
+        # the next chunk is still in flight. With the attention-bias config
+        # the post-MoE op cannot replicate the qkv GEMM (it lacks the bias),
+        # so only the o-proj pipeline is enabled there.
+        self.pipelined_k = pipelined_ar.master_k()
+        self.pipelined_k_attn = self.pipelined_k
+        if getattr(config, "attention_bias", False):
+            self.pipelined_k_moe = 0
+        else:
+            self.pipelined_k_moe = self.pipelined_k
+        if self.pipelined_k >= 2:
+            self.ar_group_name = get_tp_group().unique_name
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Self Attention
+        if self.pipelined_k < 2:
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+            hidden_states = self.block_sparse_moe(hidden_states)
+
+            return hidden_states, residual
+
+        # Pipelined-AR path. A layer returns the *unreduced* MoE partial; the
+        # next layer's post-MoE op issues the chunked all-reduce and feeds
+        # each chunk straight into input_layernorm and the qkv GEMM. The o-
+        # proj partial likewise goes through the post-attn op into
+        # post_attention_layernorm and the router GEMM.
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            normed0 = self.input_layernorm(hidden_states)
+            qkv, _ = self.self_attn.qkv_proj(normed0)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
+            qkv, residual = torch.ops.vllm.rocm_pipelined_post_moe(
+                hidden_states,  # previous layer's unreduced MoE partial
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                self.self_attn.qkv_proj.weight,
+                self.ar_group_name,
+                self.pipelined_k_moe,
+            )
+        attn_partial = self.self_attn(
             positions=positions,
-            hidden_states=hidden_states,
+            hidden_states=hidden_states,  # ignored: qkv is precomputed
+            qkv=qkv,
         )
-
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
-        hidden_states = self.block_sparse_moe(hidden_states)
-
-        return hidden_states, residual
+        moe_input, router_logits, residual = (
+            torch.ops.vllm.rocm_pipelined_post_attn(
+                attn_partial,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                self.ar_group_name,
+                self.pipelined_k_attn,
+                self.block_sparse_moe.gate_key,
+            )
+        )
+        moe_partial = self.block_sparse_moe(moe_input, router_logits)
+        return moe_partial, residual
 
 
 @support_torch_compile
@@ -382,6 +460,12 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    @property
+    def deferred_all_reduce(self) -> bool:
+        # Decoder layers return unreduced MoE partials when pipelined AR is
+        # on; the final layer's output must be reduced before the final norm.
+        return pipelined_ar.master_k() >= 2
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -413,6 +497,9 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+        if self.deferred_all_reduce:
+            # The last decoder layer returned an unreduced MoE partial.
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:

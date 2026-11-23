@@ -137,6 +137,9 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
+    VLLM_ROCM_PIPELINED_AR_K: int = 0
+    VLLM_ROCM_PIPELINED_AR_MIN_TOKENS: int = 4096
+    VLLM_ROCM_PIPELINED_AR_CUSTOM: bool = True
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -1266,6 +1269,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
+    ),
+    # Pipelined/chunked TP all-reduce on ROCm: split the big per-layer
+    # all-reduce (above the custom-AR window) into K chunks issued on a side
+    # stream, joined chunk-by-chunk into the token-local consumers
+    # (add+rmsnorm, router, qkv) instead of one joined call. 0 disables.
+    "VLLM_ROCM_PIPELINED_AR_K": lambda: int(
+        os.getenv("VLLM_ROCM_PIPELINED_AR_K", "0")
+    ),
+    # Minimum number of tokens in the reduced [tokens, hidden] tensor for the
+    # pipelined path to engage (below it, a plain all-reduce is used).
+    "VLLM_ROCM_PIPELINED_AR_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_PIPELINED_AR_MIN_TOKENS", "4096")
+    ),
+    # Allow AITER custom all-reduce for in-window chunks of the pipelined AR.
+    "VLLM_ROCM_PIPELINED_AR_CUSTOM": lambda: (
+        os.getenv("VLLM_ROCM_PIPELINED_AR_CUSTOM", "True").lower() in ("true", "1")
     ),
     # Use AITER's CustomAllreduce as the custom-allreduce backend inside vLLM's
     # CudaCommunicator on ROCm. Also enables AITER AG/RS for DP communication.
