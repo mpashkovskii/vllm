@@ -344,6 +344,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FLYDSL_MX_MLP: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS: int = 1024
     VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS: int = 136
+    VLLM_ROCM_FLYDSL_GATEUP_BF16: bool = False
     VLLM_ROCM_UNIFIED_ATTN_SPLIT_DECODE: bool = True
     VLLM_ROCM_UNIFIED_ATTN_HD256_TRITON_PREFILL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
@@ -2280,6 +2281,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight copy.
     "VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS", "136")
+    ),
+    # FP8 gate_up with a bf16 GeLU*up epilogue for gated MLPs whose down_proj stays
+    # bf16 (Gemma-style MLPs with FP8 on gate_up only): the FlyDSL gate_up kernels
+    # store gelu_tanh(gate) * up as bf16 instead of MX-quantizing it.
+    "VLLM_ROCM_FLYDSL_GATEUP_BF16": lambda: bool(
+        int(os.getenv("VLLM_ROCM_FLYDSL_GATEUP_BF16", "0"))
     ),
     "VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT": lambda: bool(
         int(os.getenv("VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT", "1"))
