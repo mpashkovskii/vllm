@@ -640,13 +640,28 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         AiterW4A16ExpertsMonolithic._flydsl_g1_dump_once(
             w_kn, s_kn, inter_true, n_pad, hidden
         )
-        gate = w_kn.index_select(2, g_idx)
-        up = w_kn.index_select(2, u_idx)
-        w1_sem = torch.cat([gate, up], dim=2).transpose(1, 2).contiguous()
-        sg = s_kn.index_select(2, g_idx)
-        su = s_kn.index_select(2, u_idx)
-        s1_sem = torch.cat([sg, su], dim=2).contiguous()  # (E, Kg, 1152)
-        w8, s_w = requant_w2_to_fp8col(w1_sem, s1_sem, hidden, pair_k0=True)
+        # Requant in expert chunks: the full-E pass stages ~8 GiB of float
+        # intermediates (mag/shifted/ksh/w8.float()) on top of the growing
+        # caches, which OOM'd the last layers at load (251 GiB allocated,
+        # iter-17). 32 experts bound the transient to ~4 GiB; the fp4 W13
+        # stays live only until this layer's build finishes.
+        e_chunk = 32
+        w8_parts, sw_parts = [], []
+        for e0 in range(0, E_, e_chunk):
+            e1 = min(e0 + e_chunk, E_)
+            gate = w_kn[e0:e1].index_select(2, g_idx)
+            up = w_kn[e0:e1].index_select(2, u_idx)
+            w1_sem = torch.cat([gate, up], dim=2).transpose(1, 2).contiguous()
+            sg = s_kn[e0:e1].index_select(2, g_idx)
+            su = s_kn[e0:e1].index_select(2, u_idx)
+            s1_sem = torch.cat([sg, su], dim=2).contiguous()  # (e, Kg, 1152)
+            w8_c, s_w_c = requant_w2_to_fp8col(
+                w1_sem, s1_sem, hidden, pair_k0=True
+            )
+            w8_parts.append(w8_c)
+            sw_parts.append(s_w_c)
+        w8 = torch.cat(w8_parts, dim=0)
+        s_w = torch.cat(sw_parts, dim=0)
 
         self._flydsl_g1_verify(
             w_kn, s_kn, g_idx, u_idx, w8, s_w, inter_true, hidden
