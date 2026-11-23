@@ -44,6 +44,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.flydsl import (
 )
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.fusion import gemma4_norm_chain, gemma4_ple_mlp
+from vllm.model_executor.layers.fusion.gemma4_ple_combine import gemma4_ple_combine
 from vllm.model_executor.layers.fusion.gemma4_ple_embed import gemma4_ple_embed_gather
 from vllm.model_executor.layers.fusion.gemma4_qkv_glue import gemma4_qkv_glue
 from vllm.model_executor.layers.fused_moe import (
@@ -1022,6 +1023,26 @@ def _linear_rows(
     return proj.quant_method._gemm_impl(proj, x, weight, None)
 
 
+def _can_fuse_ple_combine(
+    projection: torch.Tensor,
+    per_layer_inputs: torch.Tensor | None,
+    norm: RMSNorm,
+) -> bool:
+    """Whether scale + RMSNorm + add + scale of the PLE inputs can be one row kernel."""
+    return (
+        per_layer_inputs is not None
+        and projection.dtype == torch.bfloat16
+        and per_layer_inputs.dtype == torch.bfloat16
+        and per_layer_inputs.dim() == 3
+        and per_layer_inputs.shape[-1] == 256
+        and per_layer_inputs.stride(-1) == 1
+        and per_layer_inputs.stride(1) == 256
+        and projection.stride(-1) == 1
+        and norm.weight.dtype == torch.bfloat16
+        and norm.weight.shape[0] == 256
+    )
+
+
 def _ple_model_projection(
     proj: ColumnParallelLinear, x: torch.Tensor, row_start: int, num_rows: int
 ) -> torch.Tensor:
@@ -1192,6 +1213,17 @@ class Gemma4SelfDecoderLayers(nn.Module):
             )
         else:
             per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        if self.ple_split and _can_fuse_ple_combine(
+            per_layer_projection, per_layer_inputs, self.per_layer_projection_norm
+        ):
+            return gemma4_ple_combine(
+                per_layer_projection,
+                per_layer_inputs,
+                self.per_layer_projection_norm.weight,
+                self.per_layer_projection_scale,
+                self.per_layer_input_scale,
+                self.per_layer_projection_norm.variance_epsilon,
+            )
         per_layer_projection = per_layer_projection * self.per_layer_projection_scale
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1],
@@ -1316,6 +1348,17 @@ class Gemma4CrossDecoderLayers(nn.Module):
             self.layer_idx_start * dim,
             num_layers * dim,
         )
+        if _can_fuse_ple_combine(
+            per_layer_projection, per_layer_embeds, self.per_layer_projection_norm
+        ):
+            return gemma4_ple_combine(
+                per_layer_projection,
+                per_layer_embeds,
+                self.per_layer_projection_norm.weight,
+                self.per_layer_projection_scale,
+                self.per_layer_input_scale,
+                self.per_layer_projection_norm.variance_epsilon,
+            )
         per_layer_projection = per_layer_projection * self.per_layer_projection_scale
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1], num_layers, dim
