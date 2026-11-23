@@ -574,7 +574,7 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             f"bad true inter size {inter_true}"
         )
 
-        w1_data = layer.w1_weight.storage.data  # uint8 (E, N_pad, K/2), pairwise
+        w1_data = layer.w13_weight.storage.data  # uint8 (E, N_pad, K/2), pairwise
         w1_scale = weight_mx_scale(self.quant_config.w1_precision).storage.data
         E_, N_pad, Kpack = w1_data.shape
         assert N_pad // 2 >= inter_true and (N_pad // 2) % 2 == 0, (
@@ -598,7 +598,7 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         self._flydsl_g1_inter = inter_true
         # Drop the packed mxfp4 W1: with the flag on the triton GEMM1 path is
         # never dispatched, so its weight storage is dead memory.
-        layer.w1_weight.storage.data = torch.empty(
+        layer.w13_weight.storage.data = torch.empty(
             0, dtype=torch.uint8, device=w8.device
         )
         logger.info(
