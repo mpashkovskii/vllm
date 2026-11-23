@@ -194,10 +194,43 @@ def _plain_ar(inp: torch.Tensor, out: torch.Tensor, group_name: str):
 
 def _use_pipelined(num_tokens: int, k: int) -> bool:
     return (
-        k >= 2
+        _runtime_k(k) >= 2
         and current_platform.is_rocm()
         and num_tokens >= envs.VLLM_ROCM_PIPELINED_AR_MIN_TOKENS
     )
+
+
+_CTRL_CACHE: dict = {"mtime": -1.0, "path": None, "on": True}
+
+
+def _runtime_k(k: int) -> int:
+    """Runtime on/off override, for same-server A/B/A measurements.
+
+    `VLLM_ROCM_PIPELINED_AR_CTRL` (default /tmp/vllm_pipelined_ar.enabled)
+    may name a control file containing "1"/"0". Missing file = on. The file
+    mtime is checked at most once per second; a removed/missing file means
+    enabled. (Under CUDA-graph replay the op body does not re-run, so this
+    only controls eager execution paths.)
+    """
+    if k < 2:
+        return 0
+    import os
+    import time
+
+    path = os.environ.get(
+        "VLLM_ROCM_PIPELINED_AR_CTRL", "/tmp/vllm_pipelined_ar.enabled"
+    )
+    cache = _CTRL_CACHE
+    now = time.time()
+    if path != cache["path"] or now - cache["mtime"] > 1.0:
+        try:
+            with open(path) as f:
+                cache["on"] = f.read().strip() not in ("0", "false", "off", "")
+        except OSError:
+            cache["on"] = True
+        cache["mtime"] = now
+        cache["path"] = path
+    return k if cache["on"] else 0
 
 
 # ---------------------------------------------------------------------------
