@@ -63,6 +63,26 @@ def _flydsl_a8w4_g1_enabled() -> bool:
     return _flydsl_a8w4_g1_cache
 
 
+def _logical_kn(t: torch.Tensor, k_dim: int, n_dim: int, what: str) -> torch.Tensor:
+    """Normalize a 3D (E, ?, ?) storage to logical (E, k_dim, n_dim).
+
+    The w13 storage may be a transpose view (column-major for the triton
+    layout); the semantic N axis is the one with ``n_dim`` elements.
+    """
+    if t.dim() != 3:
+        raise RuntimeError(
+            f"{what} storage must be 3D, got shape {tuple(t.shape)}"
+        )
+    if t.shape[1] == k_dim and t.shape[2] == n_dim:
+        return t
+    if t.shape[1] == n_dim and t.shape[2] == k_dim:
+        return t.transpose(1, 2)
+    raise RuntimeError(
+        f"{what} storage shape {tuple(t.shape)} matches neither"
+        f" (E,{k_dim},{n_dim}) nor (E,{n_dim},{k_dim})"
+    )
+
+
 def _aiter_w4a16_silu_via_a8w4(
     hidden_states: torch.Tensor,
     w1_data,
@@ -573,26 +593,36 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         assert inter_true and inter_true % 32 == 0, (
             f"bad true inter size {inter_true}"
         )
+        hidden = mc.hidden_dim_unpadded or mc.hidden_dim
+        n_pad = 2 * mc.intermediate_size_per_partition
+        kpack = hidden // 2
+        kg = hidden // 32
 
-        w1_data = layer.w13_weight.storage.data  # uint8 (E, N_pad, K/2), pairwise
+        w1_raw = layer.w13_weight.storage.data  # uint8 (E, Kpack, N) or transposed view
         w1_scale = weight_mx_scale(self.quant_config.w1_precision).storage.data
-        E_, N_pad, Kpack = w1_data.shape
-        assert N_pad // 2 >= inter_true and (N_pad // 2) % 2 == 0, (
-            f"W1 N_pad {N_pad} cannot hold 2*inter_true={2 * inter_true}"
+        E_ = w1_raw.shape[0]
+
+        # Normalize to logical weight (E, Kpack, N_pad) and scale (E, Kg, N_pad);
+        # the storage may be a transpose view (stride(-2) == 1) -- the kernel
+        # N axis is the one with n_pad elements (the pairwise gate/up rows).
+        w_kn = _logical_kn(w1_raw, kpack, n_pad, "W1 weight")
+        s_kn = _logical_kn(
+            w1_scale.view(torch.uint8), kg, n_pad, "W1 scale"
         )
-        # de-interleave pairwise rows -> separated [gate | up] over true inter
-        wp = w1_data.view(E_, N_pad // 2, 2, Kpack)
-        w1_sem = torch.cat(
-            [wp[:, :inter_true, 0, :], wp[:, :inter_true, 1, :]], dim=1
-        ).contiguous()
-        # scales: physical (E, K_groups, N_pad); de-interleave the N dim
-        sp = w1_scale.view(E_, w1_scale.shape[1], N_pad // 2, 2)
-        s1_sem = torch.cat(
-            [sp[:, :, :inter_true, 0], sp[:, :, :inter_true, 1]], dim=2
-        ).contiguous()
-        w8, s_w = requant_w2_to_fp8col(
-            w1_sem, s1_sem, 2 * w1_sem.shape[2], pair_k0=True
-        )
+
+        # De-interleave the pairwise rows [g0, u0, g1, u1, ...] into the
+        # separated composite [gate | up] over the true inter: the first
+        # 2*inter_true pairwise rows hold the real values, the rest is padding.
+        gate = w_kn[:, :, : 2 * inter_true : 2]  # (E, Kpack, inter_true)
+        up = w_kn[:, :, 1 : 2 * inter_true : 2]
+        w1_sem = torch.cat([gate, up], dim=2).transpose(1, 2).contiguous()
+        sg = s_kn[:, :, : 2 * inter_true : 2]
+        su = s_kn[:, :, 1 : 2 * inter_true : 2]
+        s1_sem = torch.cat([sg, su], dim=2).contiguous()  # (E, Kg, 1152)
+        w8, s_w = requant_w2_to_fp8col(w1_sem, s1_sem, hidden, pair_k0=True)
+
+        self._flydsl_g1_verify(w_kn, s_kn, w8, s_w, inter_true, hidden, kg)
+
         self._flydsl_g1_w8 = w8
         self._flydsl_g1_sw = s_w
         self._flydsl_g1_inter = inter_true
@@ -605,8 +635,56 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             "VLLM_FLYDSL_A8W4_G1: cached a8w4 W1 requant (inter=%d, K=%d):"
             " %s bytes",
             inter_true,
-            2 * Kpack,
+            hidden,
             tuple(w8.shape),
+        )
+
+    @staticmethod
+    def _flydsl_g1_verify(w_kn, s_kn, w8, s_w, inter_true, hidden, kg, n=8192):
+        """Ground-truth the fp8 cache against the production W1 storage.
+
+        The triton path's validated N semantic is pairwise: storage row 2j =
+        gate_j, row 2j+1 = up_j. Under that mapping, the cache must satisfy
+        w8[e, col, k] * s_w[e, col] == mxfp4(e, row, k) exactly (both sides are
+        powers-of-two-scaled e2m1 values, exact in fp32). A wrong
+        de-interleave (or scale orientation) fails this check loudly at load,
+        not as a GSM8K regression an hour later.
+        """
+        dev = w8.device
+        E_ = w8.shape[0]
+        gen = torch.Generator(device=dev).manual_seed(0)
+        e = torch.randint(E_, (n,), device=dev, generator=gen)
+        j = torch.randint(inter_true, (n,), device=dev, generator=gen)
+        k = torch.randint(hidden, (n,), device=dev, generator=gen)
+        up_sel = torch.randint(2, (n,), device=dev, generator=gen)
+        row = 2 * j + up_sel  # pairwise storage row
+        col = j + up_sel * inter_true  # cache column (gate first, then up)
+        grp = k // 32
+        byte = w_kn[e, k // 2, row].to(torch.int32)
+        nib = (byte >> (4 * (k & 1))) & 0xF
+        e2m1 = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=dev
+        )
+        val = e2m1[(nib & 7).long()]
+        val = torch.where((nib & 8) != 0, -val, val)
+        sc = torch.exp2(s_kn.to(torch.int32)[e, grp, row] - 127.0)
+        ref = val * sc
+        got = (
+            w8.view(E_, 2 * inter_true, hidden)[e, col, k].float()
+            * s_w.view(E_, 2 * inter_true)[e, col]
+        )
+        diff = float((got - ref).abs().max())
+        logger.info(
+            "VLLM_FLYDSL_A8W4_G1 verify: max abs diff %.3e over %d samples"
+            " (ref abs max %.3f)",
+            diff,
+            n,
+            float(ref.abs().max()),
+        )
+        assert diff < 1e-6, (
+            "a8w4 G1 fp8 cache does not reproduce the production mxfp4 W1"
+            " values under the pairwise mapping (max diff %.3e) -- the W1"
+            " storage layout assumption is wrong for this backend" % diff
         )
 
     @staticmethod
