@@ -611,15 +611,18 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         )
 
         # De-interleave gate/up from the padded storage rows into the
-        # separated composite [gate | up] over the true inter. The row mapping
-        # is a backend property: the default is "halves" (the layout the
-        # AMD mono loader documents for the plain w13: gate rows [0, inter),
-        # up rows [n_pad/2, n_pad/2 + inter), zero padding in between), and
-        # VLLM_FLYDSL_A8W4_G1_MAP overrides it. The first layer dumps the
-        # storage slices to /tmp/iter17_w13_dump.pt so a wrong mapping can be
-        # identified offline (against the checkpoint) without another server
-        # cycle; the verify below fails loudly at load on a wrong mapping.
-        mapping = os.environ.get("VLLM_FLYDSL_A8W4_G1_MAP", "halves")
+        # separated composite [gate | up] over the true inter. The default
+        # "pairwise" is the identified production layout: offline analysis
+        # against the checkpoint (/tmp/iter17_w13_dump.pt from the first
+        # layer, layer 0 rank 1) matches pairwise with low-nibble-for-even-k
+        # at 100% over 3 experts x 4096 samples, and the zero structure (real
+        # rows [0, 2*inter_true), all-zero pad [2*inter_true, n_pad)) rules
+        # out "halves". VLLM_FLYDSL_A8W4_G1_MAP overrides it. The first layer
+        # dumps the storage slices to /tmp/iter17_w13_dump.pt so a wrong
+        # mapping can be identified offline (against the checkpoint) without
+        # another server cycle; the verify below fails loudly at load on a
+        # broken requant.
+        mapping = os.environ.get("VLLM_FLYDSL_A8W4_G1_MAP", "pairwise")
         if mapping == "pairwise":
             g_idx = torch.arange(0, 2 * inter_true, 2, device=w_kn.device)
             u_idx = g_idx + 1
@@ -705,11 +708,14 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         """Ground-truth the fp8 cache against the production W1 storage.
 
         ``g_idx``/``u_idx`` are the chosen row mapping (storage rows of
-        gate_j/up_j). The cache must satisfy w8[e, col, k] * s_w[e, col] ==
-        mxfp4(e, storage_row, k) exactly (both sides are powers-of-two-scaled
-        e2m1 values, exact in fp32). A wrong de-interleave (or scale
+        gate_j/up_j). The cache must satisfy w8[e, col_preshuffled, k] *
+        s_w[e, col] == mxfp4(e, storage_row, k) exactly (both sides are
+        powers-of-two-scaled e2m1 values, exact in fp32; the pair_k0
+        preshuffle is inverted below). A broken requant (or scale
         orientation) fails this check loudly at load, not as a GSM8K
-        regression an hour later.
+        regression an hour later. This check is self-consistent for ANY
+        mapping -- the mapping itself is ground-truthed offline against the
+        checkpoint (see the mapping comment in _process_weights_g1_flydsl).
         """
         dev = w8.device
         E_ = w8.shape[0]
@@ -730,8 +736,26 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         val = torch.where((nib & 8) != 0, -val, val)
         sc = torch.exp2(s_kn.to(torch.int32)[e, grp, row] - 127.0)
         ref = val * sc
+        # w8 is the pair_k0 PRESHUFFLED byte tensor coming out of
+        # requant_w2_to_fp8col: value (col, k) of the composite sits at flat
+        # byte offset (((n_blk*(hidden//64) + kpair)*4 + klane)*16 + nlane)
+        # *2 + ku)*8 + p  with n_blk=col//16, nlane=col%16, kpair=k//64,
+        # ku=(k//32)%2, klane=(k//8)%4, p=k%8. Reading w8 as plain
+        # (e, col, k) samples shuffled positions and fails a correct cache
+        # with ~1.5e-01 max diff (the iter-17 startup fault, commit
+        # 018f76e). The preshuffle-aware decode below is bit-exact
+        # (offline-proven in iter-17's microbench/w13_verify_sim.py).
+        n_blk, nlane = col // 16, col % 16
+        kpair = k // 64
+        ku = (k // 32) % 2
+        klane = (k // 8) % 4
+        pk = k % 8
+        off = (
+            ((((n_blk * (hidden // 64) + kpair) * 4 + klane) * 16 + nlane)
+             * 2 + ku) * 8 + pk
+        )
         got = (
-            w8.view(E_, 2 * inter_true, hidden)[e, col, k].float()
+            w8.view(E_, -1)[e, off].float()
             * s_w.view(E_, 2 * inter_true)[e, col]
         )
         diff = float((got - ref).abs().max())
