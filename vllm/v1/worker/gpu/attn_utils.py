@@ -191,6 +191,10 @@ def get_kv_sharing_fast_prefill_eligible_layers(
         if layer_name not in shared_kv_cache_layers:
             break
         eligible_layers.add(layer_name)
+    # a layer whose attention only runs on the sampled rows (split last self-decoder layer)
+    for layer_name, layer in attn_layers.items():
+        if getattr(layer, "fast_prefill_tail", False):
+            eligible_layers.add(layer_name)
     return eligible_layers
 
 
