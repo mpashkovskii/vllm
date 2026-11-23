@@ -339,6 +339,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_GEMMA4_KV4_V_SCALE: float = 0.5
     VLLM_ROCM_GEMMA4_FUSED_NORM_CHAIN: bool = True
     VLLM_ROCM_GEMMA4_FUSED_PLE: bool = True
+    VLLM_ROCM_GEMMA4_PLE_SPLIT: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP: bool = True
     VLLM_ROCM_FLYDSL_MX_MLP_MIN_TOKENS: int = 1024
     VLLM_ROCM_FLYDSL_MX_MLP_DECODE_MIN_TOKENS: int = 136
@@ -2307,6 +2308,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Triton projection GEMM at small token counts
     "VLLM_ROCM_GEMMA4_FUSED_PLE": lambda: bool(
         int(os.getenv("VLLM_ROCM_GEMMA4_FUSED_PLE", "1"))
+    ),
+    # With --kv-sharing-fast-prefill: per-layer inputs of the self-decoder layers over all tokens,
+    # those of the KV-shared cross-decoder layers only on the sampled positions it runs on
+    "VLLM_ROCM_GEMMA4_PLE_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_ROCM_GEMMA4_PLE_SPLIT", "1"))
     ),
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
