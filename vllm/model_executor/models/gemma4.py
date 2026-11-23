@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+import os
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -550,6 +551,7 @@ class Gemma4Attention(nn.Module):
         # writes this layer's K/V (forward_kv_only), the cross-decoder runs its Q/attention/
         # o_proj on the sampled rows (tail_only).
         self.tail_only = False
+        self._debug_full_qkv = os.getenv("VLLM_DEBUG_SPLIT23_FULL_QKV", "0") == "1"
         self.kv4 = False
         kv4_layers = {int(i) for i in envs.VLLM_ROCM_GEMMA4_KV4_LAYERS.split(",") if i.strip()}
         if kv4_layers and not self.is_sliding and kv_owner_layer_idx in kv4_layers:
@@ -612,7 +614,12 @@ class Gemma4Attention(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         """K/V projection, norm, RoPE and cache write only; returns a dummy dependency."""
-        kv = _linear_rows(self.qkv_proj, hidden_states, self.q_size, 2 * self.kv_size)
+        if self._debug_full_qkv:
+            kv = _linear_rows(self.qkv_proj, hidden_states, 0, self.q_size + 2 * self.kv_size)[
+                :, self.q_size :
+            ]
+        else:
+            kv = _linear_rows(self.qkv_proj, hidden_states, self.q_size, 2 * self.kv_size)
         return gemma4_qkv_glue(
             kv,
             positions,
