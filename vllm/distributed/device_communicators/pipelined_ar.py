@@ -224,6 +224,10 @@ def _post_attn_impl(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import vllm._custom_ops as ops
 
+    assert residual.shape == x.shape, (
+        f"rocm_pipelined_post_attn: residual {residual.shape} must match "
+        f"x {x.shape}"
+    )
     gate = _CONSUMERS[gate_key]["gate"]
     T = x.shape[0]
     normed = torch.empty_like(x)
@@ -292,6 +296,10 @@ def _post_moe_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import vllm._custom_ops as ops
 
+    assert residual.shape == x.shape, (
+        f"rocm_pipelined_post_moe: residual {residual.shape} must match "
+        f"x {x.shape}"
+    )
     T = x.shape[0]
     normed = torch.empty_like(x)
 
