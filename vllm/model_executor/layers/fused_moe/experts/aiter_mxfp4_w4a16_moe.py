@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -18,10 +21,28 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.triton_utils import triton
 
+logger = init_logger(__name__)
+
 __all__ = [
     "AiterW4A16ExpertsMonolithic",
     "aiter_triton_kernel_w4a16_moe_forward",
 ]
+
+# iter-14 (DeepSeek-V4.1-Flash uplift): opt-in env flag routing the W4A16
+# GEMM2 (down-proj) through AITER's iter-10 FlyDSL a8w4 kernel instead of the
+# triton moe_gemm_a16w4. The flag is a server-start switch (A/B): the W2 ->
+# e4m3fnuz requant is built once in process_weights_after_loading and the
+# packed mxfp4 W2 is dropped when the flag is on.
+_FLYDSL_A8W4_G2_ENV = "VLLM_FLYDSL_A8W4_G2"
+_flydsl_a8w4_g2_cache: bool | None = None
+
+
+def _flydsl_a8w4_g2_enabled() -> bool:
+    global _flydsl_a8w4_g2_cache
+    if _flydsl_a8w4_g2_cache is None:
+        val = os.environ.get(_FLYDSL_A8W4_G2_ENV, "0")
+        _flydsl_a8w4_g2_cache = val.strip().lower() in ("1", "true", "yes", "on")
+    return _flydsl_a8w4_g2_cache
 
 
 def _aiter_w4a16_silu_via_a8w4(
@@ -137,6 +158,9 @@ def aiter_triton_kernel_w4a16_moe_forward(
     score_mode: str | None = None,
     input_ids: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
+    flydsl_g2_w8: torch.Tensor | None = None,
+    flydsl_g2_sw: torch.Tensor | None = None,
+    flydsl_g2_k_true: int | None = None,
 ):
     assert quant_config is not None and rocm_aiter_ops.is_enabled()
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -304,6 +328,47 @@ def aiter_triton_kernel_w4a16_moe_forward(
         gate_valid=gate_valid,
     )
 
+    # iter-14 wire-in (env VLLM_FLYDSL_A8W4_G2): replace the triton GEMM2 with
+    # AITER's iter-10 FlyDSL a8w4 stage-2 kernel. Requires the load-time W2 ->
+    # e4m3fnuz requant cache (flydsl_g2_w8/sw, built in
+    # process_weights_after_loading) and only supports the non-EP path.
+    if (
+        flydsl_g2_w8 is not None
+        and flydsl_g2_sw is not None
+        and flydsl_g2_k_true is not None
+        and expert_map is None
+        and gate_valid is None
+    ):
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+            moe_stage2_a8w4_forward,
+        )
+
+        assert routing_data.topk_ids is not None, (
+            "VLLM_FLYDSL_A8W4_G2 requires aiter routing to expose topk_ids"
+        )
+        assert routing_data.gate_scal is not None, (
+            "VLLM_FLYDSL_A8W4_G2 requires aiter routing to expose gate_scal"
+        )
+        assert intermediate.stride(1) == 1 and intermediate.dim() == 2
+        num_experts = (
+            global_num_experts
+            if global_num_experts and global_num_experts > 0
+            else routing_data.n_expts_tot
+        )
+        return moe_stage2_a8w4_forward(
+            intermediate,
+            routing_data.topk_ids,
+            routing_data.gate_scal,
+            scatter_idx,
+            flydsl_g2_w8,
+            flydsl_g2_sw,
+            num_experts=num_experts,
+            model_dim=hidden_states.shape[-1],
+            topk=topk,
+            k_true=flydsl_g2_k_true,
+            use_gamma=not apply_router_weight_on_input,
+        )
+
     out = moe_gemm_a16w4(
         intermediate,
         w2_data,
@@ -339,6 +404,59 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             RoutingMethodType.RenormalizeNaive,
             RoutingMethodType.DeepseekV4,
             RoutingMethodType.DeepSeekV3,
+        )
+        # iter-14: cached W2 -> e4m3fnuz requant for the FlyDSL a8w4 GEMM2
+        # (filled in process_weights_after_loading when VLLM_FLYDSL_A8W4_G2 on).
+        self._flydsl_g2_w8: torch.Tensor | None = None
+        self._flydsl_g2_sw: torch.Tensor | None = None
+        self._flydsl_g2_k_true: int | None = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """iter-14: build the cached W2 -> fp8 requant for the a8w4 GEMM2.
+
+        Only runs when VLLM_FLYDSL_A8W4_G2 is set: the packed mxfp4 W2 storage
+        is dropped after the requant, so a server with the flag on exclusively
+        runs the a8w4 GEMM2 path (the flag is a server-start A/B switch).
+        """
+        if not _flydsl_a8w4_g2_enabled():
+            return
+        from vllm.platforms.rocm import on_gfx942
+
+        if not on_gfx942():
+            raise RuntimeError(
+                f"{_FLYDSL_A8W4_G2_ENV} is implemented for gfx942 only"
+            )
+
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+            requant_w2_to_fp8col,
+        )
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            weight_mx_scale,
+        )
+
+        mc = self.moe_config
+        k_true = (
+            mc.intermediate_size_per_partition_unpadded
+            or mc.intermediate_size_per_partition
+        )
+        assert k_true and k_true % 32 == 0, f"bad true inter size {k_true}"
+
+        w2_data = layer.w2_weight.storage.data
+        w2_scale = weight_mx_scale(self.quant_config.w2_precision).storage.data
+        w8, s_w = requant_w2_to_fp8col(w2_data, w2_scale, k_true, pair_k0=True)
+        self._flydsl_g2_w8 = w8
+        self._flydsl_g2_sw = s_w
+        self._flydsl_g2_k_true = k_true
+        # Drop the packed mxfp4 W2: with the flag on the triton GEMM2 path is
+        # never dispatched, so its weight storage is dead memory (0.75 GB/layer
+        # back to the KV budget).
+        layer.w2_weight.storage.data = torch.empty(
+            0, dtype=torch.uint8, device=w8.device
+        )
+        logger.info(
+            "VLLM_FLYDSL_A8W4_G2: cached a8w4 W2 requant (K=%d): %s bytes",
+            k_true,
+            tuple(w8.shape),
         )
 
     @staticmethod
@@ -462,4 +580,7 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             score_mode=score_mode,
             input_ids=input_ids,
             hash_indices_table=hash_indices_table,
+            flydsl_g2_w8=self._flydsl_g2_w8,
+            flydsl_g2_sw=self._flydsl_g2_sw,
+            flydsl_g2_k_true=self._flydsl_g2_k_true,
         )
