@@ -6986,6 +6986,10 @@ class GPUModelRunner(
                     self.kv_sharing_fast_prefill_eligible_layers.add(layer_name)
                 else:
                     break
+            # a layer whose attention only runs on the sampled rows (split last self-decoder layer)
+            for layer_name, layer in attn_layers.items():
+                if getattr(layer, "fast_prefill_tail", False):
+                    self.kv_sharing_fast_prefill_eligible_layers.add(layer_name)
 
     def initialize_kv_cache(
         self,
