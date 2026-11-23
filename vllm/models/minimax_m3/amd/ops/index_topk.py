@@ -193,7 +193,9 @@ def _bitonic_merge(
 # since prefill metadata is sliced from mixed batch metadata, seq_lens and prefix_lens
 # might lose pointer alignment, which trigger Triton recompiles. we don't actually
 # need pointer alignment for those tensors anyway because we do scalar load.
-@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+# nsplit is a runtime arg (not specialized) so a single compiled kernel serves
+# every split-K count the wrapper picks.
+@triton.jit(do_not_specialize=["nsplit"], do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _index_block_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
@@ -214,6 +216,7 @@ def _index_block_score_kernel(
     stride_s_n,
     stride_s_k,
     stride_bt_b,
+    nsplit,  # runtime split-K count (grid dim 2)
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
 ):
@@ -227,6 +230,19 @@ def _index_block_score_kernel(
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
     if BLOCK_SIZE_Q * pid_q >= q_len:
+        return
+
+    # Causal window: only blocks up to the last query token's position.
+    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
+    num_blocks = tl.cdiv(hi, BLOCK_SIZE_K)
+    # Split-K over block ranges: the per-block score (a within-block max) is
+    # independent across blocks, so each CTA owns an exclusive contiguous
+    # block range and writes plain stores -- no cross-CTA reduction.
+    pid_k = tl.program_id(2)
+    blocks_per_split = tl.cdiv(num_blocks, nsplit)
+    blk_lo = pid_k * blocks_per_split
+    blk_hi = tl.minimum(blk_lo + blocks_per_split, num_blocks)
+    if blk_lo >= blk_hi:
         return
 
     q_desc = tl.make_tensor_descriptor(
@@ -246,9 +262,7 @@ def _index_block_score_kernel(
     off_d = tl.arange(0, head_dim)
     # Block table row for this request.
     bt_row = block_table_ptr + pid_b * stride_bt_b
-    # Causal window: only blocks up to the last query token's position.
-    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    for i in tl.range(0, hi, BLOCK_SIZE_K):
+    for i in tl.range(blk_lo * BLOCK_SIZE_K, blk_hi * BLOCK_SIZE_K, BLOCK_SIZE_K):
         blk = i // BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = i + off_k
@@ -1213,8 +1227,29 @@ def minimax_m3_index_score(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    BLOCK_SIZE_Q = 64
-    grid_score = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
+    # Occupancy-first launch geometry. The score is the within-block max, so
+    # the block loop is embarrassingly parallel: split it across CTAs
+    # (third grid dim, no cross-CTA reduction) and use the tallest q tile
+    # that still fills the device. Tunes measured on gfx942 (304 CUs): above
+    # ~48 CTAs per split unit the tall (256-row) tile wins at the big mixed
+    # step shapes; the tiny-q tail shapes (few CTAs) want the 128-row tile
+    # with a much deeper block split. nsplit targets ~512 CTAs in the tall
+    # case and ~2048 with the 128-row tile, capped so a split still owns
+    # ~8 blocks of work.
+    t256 = triton.cdiv(max_query_len, 256) * batch * num_idx_heads
+    if t256 >= 48:
+        BLOCK_SIZE_Q = 256
+        nsplit = max(1, 512 // t256)
+    else:
+        BLOCK_SIZE_Q = 128
+        n_tiles = triton.cdiv(max_query_len, 128) * batch * num_idx_heads
+        nsplit = max(1, 2048 // n_tiles)
+    nsplit = min(nsplit, max(1, max_block // 8))
+    grid_score = (
+        triton.cdiv(max_query_len, BLOCK_SIZE_Q),
+        batch * num_idx_heads,
+        nsplit,
+    )
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1235,8 +1270,11 @@ def minimax_m3_index_score(
         score.stride(1),
         score.stride(2),
         block_table.stride(0),
+        nsplit,
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        num_warps=8,
+        num_stages=3,
     )
     return score
 
