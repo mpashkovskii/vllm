@@ -175,10 +175,19 @@ class SpinCondition:
         else:
             # Writer side publishes write notifications
             self.local_notify_socket: zmq.Socket = context.socket(PUB)  # type: ignore
-            # Set high water mark to 1 - we don't need to send a massive amount of
-            # pings during busy operation. PUB sockets will silently drop subsequent
-            # messages after the high water mark is reached.
-            self.local_notify_socket.setsockopt(zmq.SNDHWM, 1)
+            # Keep zmq's default high water mark on the notify socket.
+            # With SNDHWM=1, PUB drops a ping sent within zmq's stale
+            # pipe-view window (~1-3 ms on x86) of a previous one, even when
+            # the reader already consumed the previous ping: a reader that
+            # parked in between then sleeps up to
+            # SHM_READER_RECHECK_INTERVAL_MS (5 s) per cycle, which shows up
+            # as rare multi-second fleet-wide pauses (engine core parked in
+            # get_response while all workers idle in dequeue). The readers'
+            # CONFLATE already collapses ping bursts into one, so the larger
+            # default queue is safe.
+            # (upstream vllm-project/vllm#58917, tobymao's diagnosis,
+            # co-authored into #68441; rediscovered on DeepSeek-V4.1-Flash
+            # TP4 with 0.27-5.41 s engine future.result() parks.)
             self.local_notify_socket.bind(notify_address)
 
             self.last_read = 0
