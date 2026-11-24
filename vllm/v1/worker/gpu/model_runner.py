@@ -1772,11 +1772,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        from vllm.v1.worker import _iter16_telem as _i16
+        _e = _i16.enabled()
+        self._i16_enabled = _e
+        self._i16_u0 = None
         if not dummy_run:
             # Update the request states.
-            from vllm.v1.worker import _iter16_telem as _i16
-            _e = _i16.enabled()
             _rec = {"m": "v2_states", "u0": time.monotonic_ns()} if _e else None
+            if _e:
+                self._i16_u0 = _rec["u0"]
             self.update_pp_decode_requests()
             if _e: _rec["u1_pp"] = time.monotonic_ns()
             self.finish_requests(scheduler_output)
