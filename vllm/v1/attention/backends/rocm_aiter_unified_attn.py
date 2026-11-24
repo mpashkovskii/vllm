@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
 
-from typing import ClassVar
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 import torch
 
@@ -49,7 +50,76 @@ def _kv_connector_enabled() -> bool:
     return kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance
 
 
+@dataclass
+class RocmAiterUnifiedAttentionMetadata(RocmAttentionMetadata):
+    # The step's shared-prefix groups (aiter PrefixGroups), for short queries
+    prefix_groups: Any = None
+
+
+# Queries up to this long (speculative-decode verify) may read shared prefixes once.
+_SHARED_PREFIX_MAX_QUERY_LEN = 4
+# Groups per step the persistent buffers hold; further groups run as private.
+_SHARED_PREFIX_MAX_GROUPS = 32
+
+
 class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.prefix_groups = None
+        if envs.VLLM_ROCM_AITER_UNIFIED_ATTN_SHARED_PREFIX:
+            from aiter.ops.triton.attention.unified_attention import (
+                alloc_prefix_groups,
+            )
+
+            sched = vllm_config.scheduler_config
+            max_model_len = vllm_config.model_config.max_model_len
+            # Persistent: a FULL CUDA graph replays the buffers it captured.
+            self.prefix_groups = alloc_prefix_groups(
+                max_seqs=sched.max_num_seqs,
+                max_tokens=sched.max_num_batched_tokens,
+                max_blocks_per_seq=-(-max_model_len // self.block_size) + 1,
+                max_groups=_SHARED_PREFIX_MAX_GROUPS,
+                device=device,
+            )
+
+    def _build_prefix_groups(self, attn_metadata: RocmAttentionMetadata):
+        pg = self.prefix_groups
+        if (
+            pg is None
+            or attn_metadata.causal is not True
+            or attn_metadata.max_query_len > _SHARED_PREFIX_MAX_QUERY_LEN
+            or attn_metadata.seq_lens.shape[0] > pg.seq_shift.shape[0]
+            or attn_metadata.block_table.shape[1] > pg.bt_priv.shape[1]
+        ):
+            return None
+        from aiter.ops.triton.attention.unified_attention import build_prefix_groups
+
+        build_prefix_groups(
+            pg,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            attn_metadata.query_start_loc,
+            self.block_size,
+        )
+        return pg
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> RocmAiterUnifiedAttentionMetadata:
+        base = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        attn_metadata = RocmAiterUnifiedAttentionMetadata(**vars(base))
+        attn_metadata.prefix_groups = self._build_prefix_groups(attn_metadata)
+        return attn_metadata
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> RocmAttentionMetadata:
@@ -57,6 +127,9 @@ class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
         # Avoid capturing the real maximum sequence length while preserving
         # query_start_loc, which unified attention consumes during replay.
         attn_metadata.seq_lens.fill_(1)
+        if attn_metadata.prefix_groups is not None:
+            # groups of the capture's own lengths: none
+            self._build_prefix_groups(attn_metadata)
         return attn_metadata
 
 
@@ -335,6 +408,11 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 sinks=self.sinks,
                 output_scale=output_scale,
                 shuffled_kv_cache=self._use_shuffle_kv,
+                **(
+                    {"prefix_groups": attn_metadata.prefix_groups}
+                    if getattr(attn_metadata, "prefix_groups", None) is not None
+                    else {}
+                ),
             )
         else:
             # The aiter kernel is causal-only. Non-causal cross-attention

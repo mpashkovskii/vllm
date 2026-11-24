@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = False
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY: bool = True
+    VLLM_ROCM_AITER_UNIFIED_ATTN_SHARED_PREFIX: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1461,6 +1462,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention's error at that of the cache's rounding.
     "VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY": lambda: (
         os.getenv("VLLM_ROCM_AITER_UNIFIED_ATTN_QUANT_QUERY", "True").lower()
+        in ("true", "1")
+    ),
+    # In the AITER unified attention backend, read the KV blocks that several
+    # running requests share at the head of their block tables (prefix-cache
+    # hits, e.g. agent sessions of one conversation) once per group in the
+    # short-query (speculative-decode verify) calls, instead of once per request.
+    "VLLM_ROCM_AITER_UNIFIED_ATTN_SHARED_PREFIX": lambda: (
+        os.getenv("VLLM_ROCM_AITER_UNIFIED_ATTN_SHARED_PREFIX", "False").lower()
         in ("true", "1")
     ),
     # Whether to use aiter fusion shared experts ops.
