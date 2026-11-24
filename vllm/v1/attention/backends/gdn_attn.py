@@ -8,8 +8,10 @@ from typing import Literal
 
 import torch
 
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
@@ -120,6 +122,11 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     uniform_spec_sequence_length: int | None = None  # None for ragged batches
+    # Deferred GDN state commit (VLLM_GDN_DEFER_STATE_COMMIT): the spec rows'
+    # sequence lengths after this step, and the align-mode block size (0 when
+    # the Mamba cache is not in align mode). None when the commit is not deferred.
+    spec_seq_lens: torch.Tensor | None = None  # shape: [batch,]
+    defer_mamba_block_size: int = 0
 
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
@@ -257,6 +264,29 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        # The Triton GDN MTP update kernel replays a deferred draft-token state;
+        # every speculative row then runs it (the layer reads spec_seq_lens).
+        # Align-mode copies read accepted slots as full states, so the kernel
+        # needs the block size; the "all" mode keeps every state.
+        mamba_cache_mode = vllm_config.cache_config.mamba_cache_mode
+        self.defer_state_commit = (
+            self.use_spec_decode
+            and envs.VLLM_GDN_DEFER_STATE_COMMIT
+            and type(self) is GDNAttentionMetadataBuilder
+            and current_platform.is_rocm()
+            and mamba_cache_mode in ("none", "align")
+            and len(kv_cache_spec.dtypes) == 2
+            and kv_cache_spec.dtypes[1] == torch.bfloat16
+        )
+        self.defer_mamba_block_size = (
+            kv_cache_spec.block_size if mamba_cache_mode == "align" else 0
+        )
+        if self.defer_state_commit:
+            self.spec_seq_lens: torch.Tensor = torch.zeros(
+                (self.decode_cudagraph_max_bs,),
+                dtype=torch.int32,
+                device=device,
+            )
 
     @staticmethod
     def _check_chunk_metadata_override(
@@ -352,6 +382,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_seq_lens: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -521,8 +552,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert num_accepted_tokens is not None
             if num_prefills == 0 and num_decodes == 0:
                 num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+                if self.defer_state_commit:
+                    spec_seq_lens = m.seq_lens[:num_spec_decodes]
             else:
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+                if self.defer_state_commit:
+                    spec_seq_lens = m.seq_lens[spec_sequence_masks_cpu]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -670,6 +705,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
+            if spec_seq_lens is not None:
+                self.spec_seq_lens[:num_spec_decodes].copy_(
+                    spec_seq_lens, non_blocking=True
+                )
+                spec_seq_lens = self.spec_seq_lens[:batch_size]
+                spec_seq_lens[num_spec_decodes:].fill_(0)
+
         if self._stage_decode(num_prefills, num_decodes, num_spec_decodes):
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
                 non_spec_state_indices_tensor, non_blocking=True
@@ -713,6 +755,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             uniform_spec_sequence_length=uniform_spec_sequence_length,
+            spec_seq_lens=spec_seq_lens,
+            defer_mamba_block_size=self.defer_mamba_block_size,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

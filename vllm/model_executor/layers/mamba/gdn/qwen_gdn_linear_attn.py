@@ -85,6 +85,7 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.fused_gdn_decode_post_conv_mtp import (
     fused_gdn_decode_post_conv_mtp_triton,
+    fused_gdn_mtp_update_triton,
 )
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.utils.math_utils import cdiv
@@ -889,6 +890,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if self.speculative_config is not None:
             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
+        # The speculative rows of a mixed batch run the Triton MTP update kernel
+        # (the verify batches' kernel without its norm epilogue) instead of
+        # fused_sigmoid_gating. Always when the GDN metadata defers the state
+        # commit (spec_seq_lens), which only that kernel replays.
+        self._mtp_update_mixed = (
+            self.speculative_config is not None
+            and current_platform.is_rocm()
+            and envs.VLLM_GDN_MTP_UPDATE_MIXED
+        )
+        if self.speculative_config is not None and current_platform.is_rocm():
+            logger.info_once(
+                "GDN MTP update for mixed batches: %s, deferred state commit: %s",
+                self._mtp_update_mixed or envs.VLLM_GDN_DEFER_STATE_COMMIT,
+                envs.VLLM_GDN_DEFER_STATE_COMMIT,
+            )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1904,7 +1920,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        use_mtp_update = spec_sequence_masks is not None and (
+            self._mtp_update_mixed or attn_metadata.spec_seq_lens is not None
+        )
+        if use_mtp_update:
+            query_spec = key_spec = value_spec = None
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1967,7 +1989,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if use_mtp_update:
+            assert mixed_qkv_spec is not None
+            num_spec = attn_metadata.num_spec_decodes
+            spec_seq_lens = attn_metadata.spec_seq_lens
+            core_attn_out_spec = fused_gdn_mtp_update_triton(
+                mixed_qkv=mixed_qkv_spec,
+                a=a_spec,
+                b=b_spec,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                state_indices=spec_state_indices_tensor[:num_spec],  # type: ignore[index]
+                cu_seqlens=spec_query_start_loc[: num_spec + 1],  # type: ignore[index]
+                num_accepted_tokens=num_accepted_tokens[:num_spec],  # type: ignore[index]
+                state=ssm_state,
+                out=torch.empty(
+                    (mixed_qkv_spec.shape[0], *core_attn_out.shape[1:]),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                ),
+                scale=self.head_k_dim**-0.5,
+                seq_lens=None if spec_seq_lens is None else spec_seq_lens[:num_spec],
+                mamba_block_size=attn_metadata.defer_mamba_block_size,
+            ).unsqueeze(0)
+            last_recurrent_state = None
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -2372,7 +2418,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
+        defer_kwargs = {}
+        if attn_metadata.spec_seq_lens is not None:
+            # Only the Triton port (ROCm, where the builder defers) replays.
+            defer_kwargs = dict(
+                seq_lens=attn_metadata.spec_seq_lens[:num_requests],
+                mamba_block_size=attn_metadata.defer_mamba_block_size,
+            )
         fused_mtp_decode_impl()(
+            **defer_kwargs,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
