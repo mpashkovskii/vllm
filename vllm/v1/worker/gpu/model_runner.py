@@ -1774,11 +1774,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
+            from vllm.v1.worker import _iter16_telem as _i16
+            _e = _i16.enabled()
+            _rec = {"m": "v2_states", "u0": time.monotonic_ns()} if _e else None
             self.update_pp_decode_requests()
+            if _e: _rec["u1_pp"] = time.monotonic_ns()
             self.finish_requests(scheduler_output)
+            if _e: _rec["u2_fin"] = time.monotonic_ns()
             self.free_states(scheduler_output)
+            if _e: _rec["u3_free"] = time.monotonic_ns()
             self.add_requests(scheduler_output)
+            if _e: _rec["u4_add"] = time.monotonic_ns()
             self.update_requests(scheduler_output)
+            if _e:
+                import json as _json
+                _rec["u5_upd"] = time.monotonic_ns()
+                _rec["nreqs"] = len(scheduler_output.num_scheduled_tokens)
+                _rec["ntok"] = scheduler_output.total_num_scheduled_tokens
+                _i16.line(_json.dumps(_rec))
             if self.encoder_cache is not None:
                 # add_requests initializes RoPE positions from CPU metadata first.
                 for req_id, updates in scheduler_output.encoder_input_updates.items():
