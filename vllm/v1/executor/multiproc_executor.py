@@ -496,15 +496,29 @@ class MultiprocExecutor(Executor):
             response_mqs = (response_mqs[output_rank],)
 
         def get_response():
+            from vllm.v1.worker import _iter16_telem as _i16
+            _g = _i16.enabled()
             responses = []
             has_failure = False
 
-            for mq in response_mqs:
+            for _gi, mq in enumerate(response_mqs):
                 dequeue_timeout = (
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
                 try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
+                    if _g:
+                        _gt0 = time.monotonic_ns()
+                        status, result = mq.dequeue(timeout=dequeue_timeout)
+                        _gus = (time.monotonic_ns() - _gt0) // 1000
+                        if _gus >= 20_000:  # record only slow dequeues (>=20 ms)
+                            import json as _json
+                            _i16.line(_json.dumps({
+                                "gresp": 1, "ts": _gt0, "us": _gus,
+                                "m": send_method[:48] if isinstance(
+                                    send_method, str) else "?",
+                                "i": _gi, "n": len(response_mqs)}))
+                    else:
+                        status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
 
@@ -1122,7 +1136,18 @@ class WorkerProc:
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
-            response_mq.enqueue(result)
+            from vllm.v1.worker import _iter16_telem as _i16
+            if _i16.enabled():
+                _wt0 = time.monotonic_ns()
+                response_mq.enqueue(result)
+                _wus = (time.monotonic_ns() - _wt0) // 1000
+                if _wus >= 1_000:  # record enqueue stalls >=1 ms (ring/protocol blocking)
+                    import json as _json
+                    _i16.line(_json.dumps({
+                        "wresp": 1, "ts": _wt0, "us": _wus,
+                        "tid": threading.get_native_id()}))
+            else:
+                response_mq.enqueue(result)
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
