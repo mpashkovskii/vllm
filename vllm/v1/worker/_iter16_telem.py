@@ -19,11 +19,17 @@ class Sect:
     """iter-21: cheap section timer. Marks record microseconds since the
     previous mark; flush() emits one JSON line. Host-only, capture-safe."""
 
-    __slots__ = ("t0", "_prev", "rec")
+    __slots__ = ("t0", "tc0", "psr0", "_prev", "rec")
 
     def __init__(self, **kv):
         self.rec = dict(kv)
         self.t0 = self._prev = time.monotonic_ns()
+        try:
+            self.tc0 = time.clock_gettime_ns(time.CLOCK_THREAD_CPUTIME_ID)
+            self.psr0 = os.sched_getcpu()
+        except OSError:
+            self.tc0 = 0
+            self.psr0 = -1
 
     def m(self, name: str) -> None:
         now = time.monotonic_ns()
@@ -35,6 +41,15 @@ class Sect:
 
         self.rec["tot"] = (time.monotonic_ns() - self.t0) // 1_000
         self.rec["t0abs"] = self.t0
+        if self.tc0:
+            self.rec["tc"] = (
+                time.clock_gettime_ns(time.CLOCK_THREAD_CPUTIME_ID) - self.tc0
+            ) // 1_000
+        try:
+            self.rec["psr0"] = self.psr0
+            self.rec["psr1"] = os.sched_getcpu()
+        except OSError:
+            pass
         line(json.dumps(self.rec))
 
 
