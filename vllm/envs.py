@@ -331,6 +331,7 @@ if TYPE_CHECKING:
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_ROCM_BOUNDED_TOPK_SAMPLER: bool = True
     VLLM_ROCM_FUSED_LOGIT_SOFTCAP: bool = True
+    VLLM_ROCM_FP8_LM_HEAD: bool = False
     VLLM_ROCM_USE_FLYDSL_PTPC_GEMM: bool = True
     VLLM_ROCM_FUSE_GELU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_GEMMA4_FUSED_QKV_GLUE: bool = True
@@ -2259,6 +2260,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # also writes the bounded top-k selector's fp32 input
     "VLLM_ROCM_FUSED_LOGIT_SOFTCAP": lambda: bool(
         int(os.getenv("VLLM_ROCM_FUSED_LOGIT_SOFTCAP", "1"))
+    ),
+    # FP8 lm_head: per-vocab-row weight scales (created on first use from the
+    # bf16 table) x per-token dynamic activations through torch._scaled_mm
+    "VLLM_ROCM_FP8_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_ROCM_FP8_LM_HEAD", "0"))
     ),
     # FlyDSL per-token x per-channel FP8 GEMMs for the token counts where
     # row-wise torch._scaled_mm is slow (ROCm gfx950, tuned shapes only)
