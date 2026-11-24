@@ -37,6 +37,47 @@ _FLYDSL_A8W4_G2_ENV = "VLLM_FLYDSL_A8W4_G2"
 _flydsl_a8w4_g2_cache: bool | None = None
 
 
+# iter-22 (DeepSeek-V4.1-Flash uplift): opt-in env flag routing the W4A16
+# GEMM1 (gate+up + clamped silu) through AITER's iter-22 FlyDSL a8w4-FP4W
+# kernel: fp8 A (per-token online requant of the hidden states) x the
+# production mxfp4 W1 read IN PLACE -- the fp8 B operands are synthesized in
+# registers from the fp4 nibbles and e8m0 group scales (no persistent fp8 W
+# cache, so the iter-17 KV-capacity wall does not apply). Same load-time
+# pattern as iter-14's G2: the W1 repack (fragment-aligned preshuffle + plain
+# scale/shift planes) is built in process_weights_after_loading and the
+# original packed mxfp4 W1 + its scale tensor are dropped when on (net
+# negative VRAM: the repacked scales are smaller than the originals).
+_FLYDSL_A8W4FP4_G1_ENV = "VLLM_FLYDSL_A8W4FP4_G1"
+_flydsl_a8w4fp4_g1_cache: bool | None = None
+
+
+def _flydsl_a8w4fp4_g1_enabled() -> bool:
+    global _flydsl_a8w4fp4_g1_cache
+    if _flydsl_a8w4fp4_g1_cache is None:
+        val = os.environ.get(_FLYDSL_A8W4FP4_G1_ENV, "0")
+        _flydsl_a8w4fp4_g1_cache = val.strip().lower() in (
+            "1", "true", "yes", "on")
+    return _flydsl_a8w4fp4_g1_cache
+
+
+def _logical_kn(t: torch.Tensor, k_dim: int, n_dim: int, what: str) -> torch.Tensor:
+    """Normalize a 3D (E, ?, ?) storage to logical (E, k_dim, n_dim).
+
+    The w13 storage may be a transpose view (column-major for the triton
+    layout); the semantic N axis is the one with ``n_dim`` elements.
+    """
+    if t.dim() != 3:
+        raise RuntimeError(f"{what} storage must be 3D, got shape {tuple(t.shape)}")
+    if t.shape[1] == k_dim and t.shape[2] == n_dim:
+        return t
+    if t.shape[1] == n_dim and t.shape[2] == k_dim:
+        return t.transpose(1, 2)
+    raise RuntimeError(
+        f"{what} storage shape {tuple(t.shape)} matches neither"
+        f" (E,{k_dim},{n_dim}) nor (E,{n_dim},{k_dim})"
+    )
+
+
 def _flydsl_a8w4_g2_enabled() -> bool:
     global _flydsl_a8w4_g2_cache
     if _flydsl_a8w4_g2_cache is None:
@@ -158,6 +199,11 @@ def aiter_triton_kernel_w4a16_moe_forward(
     score_mode: str | None = None,
     input_ids: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
+    flydsl_g1_w4: torch.Tensor | None = None,
+    flydsl_g1_sc: torch.Tensor | None = None,
+    flydsl_g1_sh: torch.Tensor | None = None,
+    flydsl_g1_sw: torch.Tensor | None = None,
+    flydsl_g1_inter: int | None = None,
     flydsl_g2_w8: torch.Tensor | None = None,
     flydsl_g2_sw: torch.Tensor | None = None,
     flydsl_g2_k_true: int | None = None,
@@ -305,28 +351,87 @@ def aiter_triton_kernel_w4a16_moe_forward(
     # used Gluon before this and is unaffected, so leave it on auto-detect.
     a16w4_backend = "triton" if on_gfx950() else None
 
-    intermediate = moe_gemm_a16w4(
-        hidden_states,
-        w1_data,
-        None,
-        w1_wscale,
-        None,
-        None,
-        quant_config.w1_bias,
-        routing_data,
-        gather_indx=gather_idx,
-        gammas=gammas if apply_router_weight_on_input else None,
-        swizzle_mx_scale=swz,
-        apply_swiglu=True,
-        alpha=swiglu_alpha,
-        limit=swiglu_limit,
-        swiglu_add_residual=swiglu_add_residual,
-        unpadded_N=unpadded_N_w1,
-        unpadded_K=unpadded_K_w1,
-        backend=a16w4_backend,
-        expert_map=expert_map,
-        gate_valid=gate_valid,
-    )
+    # iter-22 wire-in (env VLLM_FLYDSL_A8W4FP4_G1): replace the triton GEMM1
+    # with AITER's iter-22 FlyDSL a8w4-FP4W stage-1 kernel (fp8 A x native
+    # mxfp4 W1 with in-register fp8 synthesis; no persistent fp8 W cache, so
+    # no KV-capacity cost). Requires the load-time repack (flydsl_g1_w4/sc/
+    # sh/sw, built in process_weights_after_loading). Constraints match
+    # iter-14's G2: non-EP path, SILU activation, and no
+    # apply_router_weight_on_input (the G1 gathers hidden rows per token, so
+    # a per-(token, slot) gamma cannot fold into the per-token A scale).
+    if (
+        flydsl_g1_w4 is not None
+        and flydsl_g1_sc is not None
+        and flydsl_g1_sh is not None
+        and flydsl_g1_sw is not None
+        and flydsl_g1_inter is not None
+        and expert_map is None
+        and gate_valid is None
+        and activation == MoEActivation.SILU
+        and not apply_router_weight_on_input
+    ):
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.stage1_a8w4fp4_server import (  # noqa: E501
+            moe_stage1_a8w4fp4_forward,
+        )
+
+        assert routing_data.topk_ids is not None, (
+            "VLLM_FLYDSL_A8W4FP4_G1 requires aiter routing to expose topk_ids"
+        )
+        assert routing_data.gate_scal is not None, (
+            "VLLM_FLYDSL_A8W4FP4_G1 requires aiter routing to expose gate_scal"
+        )
+        num_experts = (
+            global_num_experts
+            if global_num_experts and global_num_experts > 0
+            else routing_data.n_expts_tot
+        )
+        canon_gammas = routing_data.gate_scal.float().index_select(
+            0, scatter_idx.long()
+        )
+        intermediate = moe_stage1_a8w4fp4_forward(
+            hidden_states,
+            routing_data.topk_ids,
+            canon_gammas,
+            scatter_idx,
+            routing_data.gate_scal.numel(),
+            flydsl_g1_w4,
+            flydsl_g1_sc,
+            flydsl_g1_sh,
+            flydsl_g1_sw,
+            num_experts=num_experts,
+            inter_dim=flydsl_g1_inter,
+            topk=topk,
+            swiglu_limit=(
+                swiglu_limit if swiglu_limit is not None else float("inf")
+            ),
+            tile_m=64,
+            tile_n=192,
+            tile_k=128,
+            xcd_swizzle=2,
+        )
+    else:
+        intermediate = moe_gemm_a16w4(
+            hidden_states,
+            w1_data,
+            None,
+            w1_wscale,
+            None,
+            None,
+            quant_config.w1_bias,
+            routing_data,
+            gather_indx=gather_idx,
+            gammas=gammas if apply_router_weight_on_input else None,
+            swizzle_mx_scale=swz,
+            apply_swiglu=True,
+            alpha=swiglu_alpha,
+            limit=swiglu_limit,
+            swiglu_add_residual=swiglu_add_residual,
+            unpadded_N=unpadded_N_w1,
+            unpadded_K=unpadded_K_w1,
+            backend=a16w4_backend,
+            expert_map=expert_map,
+            gate_valid=gate_valid,
+        )
 
     # iter-14 wire-in (env VLLM_FLYDSL_A8W4_G2): replace the triton GEMM2 with
     # AITER's iter-10 FlyDSL a8w4 stage-2 kernel. Requires the load-time W2 ->
@@ -410,6 +515,14 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         self._flydsl_g2_w8: torch.Tensor | None = None
         self._flydsl_g2_sw: torch.Tensor | None = None
         self._flydsl_g2_k_true: int | None = None
+        # iter-22: layout-only repack of the packed mxfp4 W1 + derived scale
+        # planes for the FlyDSL a8w4-FP4W GEMM1 (filled in
+        # process_weights_after_loading when VLLM_FLYDSL_A8W4FP4_G1 on).
+        self._flydsl_g1_w4: torch.Tensor | None = None
+        self._flydsl_g1_sc: torch.Tensor | None = None
+        self._flydsl_g1_sh: torch.Tensor | None = None
+        self._flydsl_g1_sw: torch.Tensor | None = None
+        self._flydsl_g1_inter: int | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """iter-14: build the cached W2 -> fp8 requant for the a8w4 GEMM2.
@@ -418,6 +531,7 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         is dropped after the requant, so a server with the flag on exclusively
         runs the a8w4 GEMM2 path (the flag is a server-start A/B switch).
         """
+        self.process_weights_after_loading_g1fp4(layer)
         if not _flydsl_a8w4_g2_enabled():
             return
         from vllm.platforms.rocm import on_gfx942
@@ -457,6 +571,152 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             "VLLM_FLYDSL_A8W4_G2: cached a8w4 W2 requant (K=%d): %s bytes",
             k_true,
             tuple(w8.shape),
+        )
+
+    def process_weights_after_loading_g1fp4(self, layer: torch.nn.Module) -> None:
+        """iter-22: layout-only repack of the packed mxfp4 W1 for the
+        a8w4-FP4W GEMM1 (fragment-aligned preshuffle + plain scale/shift
+        planes + fp32 per-column epilog scale).
+
+        Only runs when VLLM_FLYDSL_A8W4FP4_G1 is set: the packed mxfp4 W1
+        and its production scale storage are dropped after the repack (the
+        repacked sc plane plus the tiny shift/epilog planes are smaller), so
+        a server with the flag on runs the a8w4-FP4W GEMM1 exclusively.
+        """
+        if not _flydsl_a8w4fp4_g1_enabled():
+            return
+        from vllm.platforms.rocm import on_gfx942
+
+        if not on_gfx942():
+            raise RuntimeError(
+                f"{_FLYDSL_A8W4FP4_G1_ENV} is implemented for gfx942 only"
+            )
+
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+            repack_w13_pairwise_to_a8w4fp4,
+        )
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            weight_mx_scale,
+        )
+
+        mc = self.moe_config
+        inter_true = (
+            mc.intermediate_size_per_partition_unpadded
+            or mc.intermediate_size_per_partition
+        )
+        assert inter_true and inter_true % 32 == 0, (
+            f"bad true inter size {inter_true}"
+        )
+        hidden = mc.hidden_dim_unpadded or mc.hidden_dim
+        n_pad = 2 * mc.intermediate_size_per_partition
+        kpack = hidden // 2
+        kg = hidden // 32
+
+        w1_raw = layer.w13_weight.storage.data
+        w1_scale = weight_mx_scale(self.quant_config.w1_precision).storage.data
+        E_ = w1_raw.shape[0]
+
+        w_kn = _logical_kn(w1_raw, kpack, n_pad, "W1 weight")
+        s_kn = _logical_kn(w1_scale.view(torch.uint8), kg, n_pad, "W1 scale")
+
+        # Chunked over experts to bound the repack transients (the GGUU
+        # index_select + shuffle + fragment-alignment permute stage a few
+        # tensors of the packed-W1 size each).
+        e_chunk = 32
+        w4_parts, sc_parts, sh_parts, sw_parts = [], [], [], []
+        for e0 in range(0, E_, e_chunk):
+            e1 = min(e0 + e_chunk, E_)
+            w4_c, sc_c, sh_c, sw_c = repack_w13_pairwise_to_a8w4fp4(
+                w_kn[e0:e1], s_kn[e0:e1], inter_true
+            )
+            w4_parts.append(w4_c)
+            sc_parts.append(sc_c)
+            sh_parts.append(sh_c)
+            sw_parts.append(sw_c)
+        w4 = torch.cat(w4_parts, dim=0)
+        sc = torch.cat(sc_parts, dim=0)
+        sh = torch.cat(sh_parts, dim=0)
+        sw = torch.cat(sw_parts, dim=0)
+
+        self._flydsl_g1fp4_verify(
+            w_kn, s_kn, w4, sc, sh, sw, inter_true, hidden
+        )
+
+        self._flydsl_g1_w4 = w4
+        self._flydsl_g1_sc = sc
+        self._flydsl_g1_sh = sh
+        self._flydsl_g1_sw = sw
+        self._flydsl_g1_inter = inter_true
+        # Drop the packed mxfp4 W1 and its production scale storage: with the
+        # flag on the triton GEMM1 path is never dispatched.
+        dev = w4.device
+        layer.w13_weight.storage.data = torch.empty(
+            0, dtype=torch.uint8, device=dev
+        )
+        w1_scale_holder = weight_mx_scale(self.quant_config.w1_precision)
+        w1_scale_holder.storage.data = torch.empty(
+            0, dtype=torch.uint8, device=dev
+        )
+        logger.info(
+            "VLLM_FLYDSL_A8W4FP4_G1: repacked W1 in place (inter=%d, K=%d):"
+            " w4 %s sc %s bytes",
+            inter_true,
+            hidden,
+            tuple(w4.shape),
+            tuple(sc.shape),
+        )
+
+    @staticmethod
+    def _flydsl_g1fp4_verify(w_kn, s_kn, w4, sc, sh, sw, inter_true, hidden,
+                             n=8192):
+        """Ground-truth the W1 repack against the production W1 storage.
+
+        Every sampled (e, col, k): the v2 fragment-aligned byte at its
+        computed address must equal the production packed byte at
+        w_kn[e, k//2, row] (the same two e2m1 nibbles, layout-only move);
+        the scale planes must satisfy sc[e, col, g] == s_kn[e, g, row],
+        sh[e, col] == max_g s_kn[e, g, row], sw == 2^(sh - 127). A wrong
+        mapping or orientation fails loudly at load (the iter-17 lesson),
+        not as an accuracy regression an hour later.
+        """
+        dev = w4.device
+        E_ = w4.shape[0]
+        gen = torch.Generator(device=dev).manual_seed(0)
+        e = torch.randint(E_, (n,), device=dev, generator=gen)
+        col = torch.randint(2 * inter_true, (n,), device=dev, generator=gen)
+        k = torch.randint(hidden, (n,), device=dev, generator=gen)
+        gate = col < inter_true
+        row = torch.where(gate, 2 * col, 2 * (col - inter_true) + 1)
+        # production packed byte + nibble
+        byte_p = w_kn[e, k // 2, row].to(torch.int32)
+        nib_p = (byte_p >> (4 * (k & 1))) & 0xF
+        # v2 fragment-aligned byte address:
+        # (E, N0=col/16, K0=k/128, LD=(k%32)/8, NL=col%16, KL=(k/32)%4, b/2)
+        n0, nl = col // 16, col % 16
+        k128, kl = k // 128, (k // 32) % 4
+        ld, bb = (k % 32) // 8, (k % 8) // 2
+        addr = (
+            ((((n0 * (hidden // 128) + k128) * 4 + ld) * 16 + nl) * 4 + kl)
+            * 4 + bb
+        )
+        byte_v = w4.view(E_, -1)[e, addr].to(torch.int32)
+        nib_v = (byte_v >> (4 * (k & 1))) & 0xF
+        nib_diff = int((nib_v != nib_p).sum())
+        sc_diff = int(
+            (sc[e, col, k // 32] != s_kn[e, k // 32, row]).sum()
+        )
+        sh_ref = s_kn[e, :, row].amax(dim=1)
+        sh_diff = int((sh[e, col] != sh_ref).sum())
+        sw_ref = torch.exp2(sh[e, col].to(torch.float32) - 127.0)
+        sw_diff = float((sw[e, col] - sw_ref).abs().max())
+        logger.info(
+            "VLLM_FLYDSL_A8W4FP4_G1 verify: nib mismatches %d, sc %d, sh %d,"
+            " sw max diff %.3e over %d samples",
+            nib_diff, sc_diff, sh_diff, sw_diff, n,
+        )
+        assert nib_diff == 0 and sc_diff == 0 and sh_diff == 0 and sw_diff == 0.0, (
+            "a8w4-FP4W G1 repack does not reproduce the production mxfp4 W1"
+            " layout (see counts above)"
         )
 
     @staticmethod
@@ -580,6 +840,11 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             score_mode=score_mode,
             input_ids=input_ids,
             hash_indices_table=hash_indices_table,
+            flydsl_g1_w4=self._flydsl_g1_w4,
+            flydsl_g1_sc=self._flydsl_g1_sc,
+            flydsl_g1_sh=self._flydsl_g1_sh,
+            flydsl_g1_sw=self._flydsl_g1_sw,
+            flydsl_g1_inter=self._flydsl_g1_inter,
             flydsl_g2_w8=self._flydsl_g2_w8,
             flydsl_g2_sw=self._flydsl_g2_sw,
             flydsl_g2_k_true=self._flydsl_g2_k_true,
