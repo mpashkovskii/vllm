@@ -1392,6 +1392,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_desc: BatchExecutionDescriptor,
         num_active_loras: int,
     ) -> InputBatch:
+        # iter-21: section sub-timing, shares execute_model's sect; None when
+        # the env is off.
+        _sect = getattr(self, "_i16_sect", None)
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
@@ -1399,6 +1402,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if envs.VLLM_MOE_SKIP_PADDING:
             is_padding[:num_tokens].fill_(False)
             is_padding[num_tokens:].fill_(True)
+        if _sect is not None: _sect.m("pd_pad")
 
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
@@ -1456,6 +1460,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     cu_num_logits_np,
                 )
             )
+        if _sect is not None: _sect.m("pd_draft")
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
@@ -1482,6 +1487,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
+        if _sect is not None: _sect.m("pd_qsl")
 
         # Get prefill tokens if any.
         if batch_req_state.has_prefill:
@@ -1494,6 +1500,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
             )
+        if _sect is not None: _sect.m("pd_pft")
 
         # Prepare positions and seq_lens.
         prepare_pos_seq_lens(
@@ -1503,6 +1510,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
         )
+        if _sect is not None: _sect.m("pd_posl")
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
         # Some input token ids are directly read from the last sampled tokens
@@ -1519,6 +1527,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
         )
+        if _sect is not None: _sect.m("pd_comb")
 
         fast_prefill = None
         if self.fast_prefill is not None:
@@ -1530,6 +1539,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc,
                 num_active_loras=num_active_loras,
             )
+        if _sect is not None: _sect.m("pd_fp")
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
@@ -1590,6 +1600,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
+        if _sect is not None: _sect.m("pd_np")
         return input_batch
 
     def prepare_attn(
@@ -1776,6 +1787,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         _e = _i16.enabled()
         self._i16_enabled = _e
         self._i16_u0 = None
+        # iter-21: sub-timed sections of the prepare/forward host path,
+        # one aggregated "prep" line per real batch. Inert without the env.
+        _sect = _i16.new_sect(m="prep") if (_e and not dummy_run) else None
+        self._i16_sect = _sect
         if not dummy_run:
             # Update the request states.
             _rec = {"m": "v2_states", "u0": time.monotonic_ns()} if _e else None
@@ -1820,6 +1835,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
             scheduler_output, dummy_run
         )
+        if _sect is not None: _sect.m("gbrs")
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
             if batch_req_state.has_prefill:
@@ -1863,6 +1879,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_decode=uniform_tok_count == self.decode_query_len,
             allow_skip_drafts=scheduler_output.skip_drafts,
         )
+        if _sect is not None: _sect.m("dcg")
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1879,7 +1896,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
+            if _sect is not None: _sect.m("pi")
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            if _sect is not None: _sect.m("patn")
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1890,6 +1909,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
+            if _sect is not None: _sect.m("ppst")
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1965,11 +1985,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cg_mode=batch_desc.cg_mode,
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if _sect is not None: _sect.m("ubatch")
         elif not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
             )
+            if _sect is not None: _sect.m("bsm")
             assert block_tables is not None
             attn_groups = self.attn_groups
             if dummy_run and is_profile and not valid_dummy_state_slots:
@@ -1993,6 +2015,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if _sect is not None: _sect.m("attnmd")
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2034,6 +2057,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        if _sect is not None: _sect.m("mi")
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             if not requires_raw_input_tokens(self.model):
@@ -2058,6 +2082,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(
             self.model_config, input_batch.num_tokens, ubatch_slices
         )
+        if _sect is not None: _sect.m("eplb")
 
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
@@ -2114,6 +2139,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if _sect is not None: _sect.m("fwd")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2159,6 +2185,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
+        if _sect is not None:
+            _sect.m("stm")
+            _sect.rec["nreq"] = num_reqs
+            _sect.rec["ntok"] = num_toks
+            _sect.rec["full"] = int(batch_desc.cg_mode == CUDAGraphMode.FULL)
+            _sect.flush()
+            self._i16_sect = None
         return None
 
     @torch.inference_mode()
