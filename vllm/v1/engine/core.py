@@ -1669,6 +1669,9 @@ class EngineCoreProc(EngineCore):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        from vllm.v1.engine import _iter20_stack
+
+        _iter20_stack.start()
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
@@ -1695,6 +1698,10 @@ class EngineCoreProc(EngineCore):
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
+        _i20_t = None
+        from vllm.v1.worker import _iter16_telem as _i16
+        if _i16.enabled():
+            _i20_t = time.monotonic_ns()
         waited = False
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
@@ -1723,6 +1730,8 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+        if _i20_t is not None:
+            self._i20_last_inq_us = (time.monotonic_ns() - _i20_t) // 1000
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -1731,6 +1740,10 @@ class EngineCoreProc(EngineCore):
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         _ie = getattr(self, "_telem_i20_step", None)
+        _lp = None
+        from vllm.v1.worker import _iter16_telem as _i16lp
+        if _i16lp.enabled():
+            _lp = [time.monotonic_ns()]
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -1766,6 +1779,13 @@ class EngineCoreProc(EngineCore):
                 for _rec in _i20_recs:
                     _rec["enqpost"] = 0
                     _i16.line(_json.dumps(_rec))
+        if _lp is not None:
+            _lp.append(time.monotonic_ns())
+            import json as _json
+            _i16lp.line(_json.dumps({
+                "loop": 1, "ts": _lp[0],
+                "enqpost": (_lp[1] - _lp[0]) // 1000,
+                "inq": getattr(self, "_i20_last_inq_us", None)}))
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
@@ -2553,6 +2573,9 @@ class DPEngineCoreProc(EngineCoreProc):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
+        from vllm.v1.engine import _iter20_stack
+
+        _iter20_stack.start()
         # Loop until process is sent a SIGINT or SIGTERM
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
