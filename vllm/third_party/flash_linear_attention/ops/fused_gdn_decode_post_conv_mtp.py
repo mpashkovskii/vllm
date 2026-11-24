@@ -28,6 +28,7 @@ accepted token as a full state, so near a boundary (a multiple of the block size
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
 
@@ -78,7 +79,9 @@ def _gdn_mtp_update_kernel(
     if DEFER:
         # Record layout per 32-row chunk of a head, in the state's bf16 elements:
         # raw k [0, K), then as fp32 the corrected values [K/2, K/2 + CH) and the
-        # decay at K/2 + CH. A chunk is CH * K elements, CH * K / 2 fp32 words.
+        # decay at K/2 + CH, stored CH times so that every store fills whole
+        # 128-byte lines (a 4-byte store cost more than all the rest of the
+        # record). A chunk is CH * K elements, CH * K / 2 fp32 words.
         CH: tl.constexpr = 32
         p_row = state_indices + i_n * stride_indices_row
         computed = tl.load(seq_lens + i_n).to(tl.int64) - num_tokens
@@ -106,8 +109,10 @@ def _gdn_mtp_update_kernel(
     p_state = i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     b_h = tl.load(state + src * stride_state_slot + p_state).to(tl.float32)
     if DEFER:
-        o_rec = (o_v // CH) * (CH * K // 2) + K // 2 + o_v % CH
+        # Loading the first record ahead of the state spills at 128 VGPRs and is
+        # slower (MI350P).
         chunk0 = i_v * (BV // CH)
+        o_rec = (o_v // CH) * (CH * K // 2) + K // 2 + o_v % CH
         if pending:
             # Replay the accepted draft tokens of the previous step.
             for j in range(1, accepted):
@@ -126,8 +131,7 @@ def _gdn_mtp_update_kernel(
         row = bos + t
         p_qkv = mixed_qkv + row * stride_qkv_row
         b_q = tl.load(p_qkv + i_h * K + o_k).to(tl.float32)
-        b_k_raw = tl.load(p_qkv + (H + i_h) * K + o_k)
-        b_k = b_k_raw.to(tl.float32)
+        b_k = tl.load(p_qkv + (H + i_h) * K + o_k).to(tl.float32)
         b_v = tl.load(p_qkv + 2 * H * K + i_hv * V + o_v).to(tl.float32)
         x = tl.load(a + row * stride_a_row + i_hv).to(tl.float32) + bias
         decay = tl.exp(neg_A * tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x))
@@ -151,11 +155,14 @@ def _gdn_mtp_update_kernel(
                     p_rec = state + dst * stride_state_slot + i_hv * V * K
                     p_rec32 = p_rec.to(tl.pointer_type(tl.float32))
                     tl.store(p_rec32 + o_rec, b_v)
+                    # Raw k again (an L2 hit) rather than held across the update.
+                    b_k_raw = tl.load(p_qkv + (H + i_h) * K + o_k)
                     for j in tl.static_range(BV // CH):
                         p_chunk = p_rec + (chunk0 + j) * CH * K
                         tl.store(p_chunk + o_k, b_k_raw.to(state.dtype.element_ty))
                         p_chunk32 = p_rec32 + (chunk0 + j) * (CH * K // 2)
-                        tl.store(p_chunk32 + K // 2 + CH, decay)
+                        o_ch = K // 2 + CH + tl.arange(0, CH)
+                        tl.store(p_chunk32 + o_ch, tl.zeros([CH], tl.float32) + decay)
                 else:
                     p_dst = state + dst * stride_state_slot + p_state
                     tl.store(p_dst, b_h.to(state.dtype.element_ty))
@@ -238,13 +245,21 @@ def _gdn_mtp_update(
         # A record (raw k, CH fp32 values, an fp32 decay) fits in a 32-row chunk
         # of a bf16 head; the model's k is bf16, so storing it raw is exact.
         assert state.dtype == torch.bfloat16 and mixed_qkv.dtype == torch.bfloat16
-        assert V % 32 == 0 and K % 2 == 0 and K * 2 + 33 * 4 <= 32 * K * 2
+        assert V % 32 == 0 and K % 64 == 0
         assert seq_lens.is_contiguous() and seq_lens.numel() >= num_requests
     # Tile V only while the GPU needs more programs: 32 rows per program while there are fewer
     # (request, value head) pairs than CUs, 64 up to 4x the CUs, else one tile per value head
     # (tuned on MI300X and MI350X).
     heads, num_cus = num_requests * HV, num_compute_units(out.device.index)
     BV = 32 if heads < num_cus else 64 if heads <= 4 * num_cus else V
+    num_warps, launch_kwargs = 4, {}
+    if defer and heads >= num_cus and V % 64 == 0:
+        # Half the bytes of the stored-state kernel per program: more, smaller
+        # programs keep the memory busy (MI350P, 32-254 requests x 2-3 tokens: 6-25%
+        # faster than the tiling above), at 128 VGPRs for 4 waves per SIMD.
+        BV, num_warps = 64, 2
+        if current_platform.is_rocm():
+            launch_kwargs["waves_per_eu"] = 4
     sum_sq = torch.empty(
         (out.shape[0], HV, V // BV), dtype=torch.float32, device=out.device
     )
@@ -275,7 +290,8 @@ def _gdn_mtp_update(
         V=V,
         BV=BV,
         DEFER=defer,
-        num_warps=4,
+        num_warps=num_warps,
+        **launch_kwargs,
     )
     return sum_sq, BV
 
