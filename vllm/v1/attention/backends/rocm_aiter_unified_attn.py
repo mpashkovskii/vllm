@@ -75,8 +75,12 @@ class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
         self.prefix_groups = None
         if envs.VLLM_ROCM_AITER_UNIFIED_ATTN_SHARED_PREFIX:
             from aiter.ops.triton.attention.unified_attention import (
+                PREFIX_GROUPS_MIN_SEQS,
                 alloc_prefix_groups,
             )
+
+            # smaller batches never read shared prefixes once: skip their build
+            self._prefix_groups_min_seqs = PREFIX_GROUPS_MIN_SEQS
 
             sched = vllm_config.scheduler_config
             max_model_len = vllm_config.model_config.max_model_len
@@ -119,7 +123,8 @@ class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
                 return None
             lead = (num_seqs, int(qsl[num_seqs]), int(qlens[:num_seqs].max()))
         if (
-            num_seqs > pg.seq_shift.shape[0]
+            num_seqs < self._prefix_groups_min_seqs
+            or num_seqs > pg.seq_shift.shape[0]
             or attn_metadata.block_table.shape[1] > pg.bt_priv.shape[1]
             or (lead is not None and lead[1] > pg.tok_vtok.shape[0])
         ):
