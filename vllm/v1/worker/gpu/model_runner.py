@@ -212,6 +212,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.observability_config = vllm_config.observability_config
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
+        # Cache for sort_batch_req_ids: invalidated by full-equality snapshot
+        # of the token counts and draft lists (see gather_batch_req_state).
+        self._batch_sort_cache = None
 
         self.device = device
         self.dtype = self.model_config.dtype
@@ -1322,10 +1325,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         _g = getattr(self, "_i16_sect", None)
-        # batch_idx -> req_id
-        req_ids = sort_batch_req_ids(
-            num_tokens_per_req, draft_tokens, self.decode_query_len
-        )
+        # batch_idx -> req_id. The sorted order only depends on the
+        # num-tokens map and the draft-token lists; both change rarely during
+        # steady decode (same request set, same per-step counts), so the sort
+        # result is cached against a full-equality snapshot of both. Exact:
+        # any change re-sorts.
+        _sort_cache = self._batch_sort_cache
+        if (
+            _sort_cache is not None
+            and num_tokens_per_req == _sort_cache["tokens"]
+            and {r: tuple(draft_tokens.get(r, ())) for r in num_tokens_per_req}
+            == _sort_cache["drafts"]
+        ):
+            # Return a fresh list: callers may hold it beyond this step.
+            req_ids = list(_sort_cache["req_ids"])
+        else:
+            req_ids = sort_batch_req_ids(
+                num_tokens_per_req, draft_tokens, self.decode_query_len
+            )
+            self._batch_sort_cache = {
+                "tokens": dict(num_tokens_per_req),
+                "drafts": {r: tuple(draft_tokens.get(r, ())) for r in num_tokens_per_req},
+                "req_ids": req_ids,
+            }
         if _g is not None: _g.m("gb_sort")
 
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
