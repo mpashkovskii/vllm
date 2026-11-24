@@ -173,21 +173,29 @@ class SpinCondition:
             self.poller.register(self.read_cancel_socket, zmq.POLLIN)
             self.poller.register(self.local_notify_socket, zmq.POLLIN)
         else:
-            # Writer side publishes write notifications
-            self.local_notify_socket: zmq.Socket = context.socket(PUB)  # type: ignore
-            # Keep zmq's default high water mark on the notify socket.
-            # With SNDHWM=1, PUB drops a ping sent within zmq's stale
-            # pipe-view window (~1-3 ms on x86) of a previous one, even when
-            # the reader already consumed the previous ping: a reader that
-            # parked in between then sleeps up to
-            # SHM_READER_RECHECK_INTERVAL_MS (5 s) per cycle, which shows up
-            # as rare multi-second fleet-wide pauses (engine core parked in
-            # get_response while all workers idle in dequeue). The readers'
-            # CONFLATE already collapses ping bursts into one, so the larger
-            # default queue is safe.
-            # (upstream vllm-project/vllm#58917, tobymao's diagnosis,
+            # Writer side publishes write notifications. XPUB with an
+            # unlimited high water mark (SNDHWM=0) so no ping is ever dropped
+            # for capacity: PUB drops a ping sent within zmq's stale
+            # pipe-view window (~1-3 ms on x86) of enough previous ones whose
+            # sum reaches the HWM (1, or any finite value), even when the
+            # reader already consumed them. A reader that parked in between
+            # the writes then sleeps until SHM_READER_RECHECK_INTERVAL_MS
+            # (5 s) per poll cycle, which shows up as rare multi-second
+            # fleet-wide pauses (engine core parked in get_response while
+            # all workers idle in the command dequeue; worker cores parked
+            # symmetrically when the engine is the writer).
+            # The readers' SUB with CONFLATE already collapses a ping burst
+            # into one, so the unlimited writer queue does not change what a
+            # reader sees; XPUB (rather than PUB + SNDHWM=0) matches upstream
+            # vllm-project/vllm#68441 and also surfaces subscription
+            # messages to anyone who wants them (nobody here reads them).
+            # (diagnosis: upstream vllm-project/vllm#58917 by tobymao,
             # co-authored into #68441; rediscovered on DeepSeek-V4.1-Flash
-            # TP4 with 0.27-5.41 s engine future.result() parks.)
+            # TP4 with 0.27-5.41 s engine future.result() parks; SNDHWM=1
+            # removal alone left 1-2 recheck-quantized parks per c128 hour
+            # on mixed 16k-token steps.)
+            self.local_notify_socket: zmq.Socket = context.socket(XPUB)  # type: ignore
+            self.local_notify_socket.setsockopt(zmq.SNDHWM, 0)
             self.local_notify_socket.bind(notify_address)
 
             self.last_read = 0
