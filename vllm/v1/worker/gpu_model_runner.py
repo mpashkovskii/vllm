@@ -3942,7 +3942,16 @@ class GPUModelRunner(
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
+            from vllm.v1.worker import _iter16_telem as _i16
+            _i16_us = time.monotonic_ns() if _i16.enabled() else 0
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if _i16.enabled():
+                import json as _json
+                _i16.line(_json.dumps(
+                    {"m": "update_states", "t0": _i16_us,
+                     "t1": time.monotonic_ns(),
+                     "num_reqs": self.input_batch.num_reqs,
+                     "ntok": num_scheduled_tokens}))
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
