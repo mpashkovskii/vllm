@@ -232,6 +232,7 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        self._telem_i20_bq: list[dict] = []
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -745,14 +746,21 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        from vllm.v1.worker import _iter16_telem as _i16
+
+        _i20 = _i16.enabled()
+        _tt = time.monotonic_ns
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            _t0 = _tt() if _i20 else 0
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            _t1 = _tt() if _i20 else 0
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            _t2 = _tt() if _i20 else 0
             if not self.is_mm_encoder_only:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -773,6 +781,17 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+            if _i20:
+                _prev = getattr(self, "_i20_prev_send", 0)
+                self._i20_prev_send = _t2
+                self._telem_i20_bq.append(dict(
+                    bqsend=1, ts=_t0,
+                    gap_prev_send=(_t2 - _prev) // 1000 if _prev else 0,
+                    sched=(_t1 - _t0) // 1000,
+                    send=(_t2 - _t1) // 1000,
+                    gram=(_tt() - _t2) // 1000,
+                    nreq=len(scheduler_output.num_scheduled_tokens),
+                    ntok=scheduler_output.total_num_scheduled_tokens))
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
@@ -791,6 +810,7 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
+        _t4 = _tt() if _i20 else 0
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -802,15 +822,28 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        _t6 = _tt() if _i20 else 0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        _t7 = _tt() if _i20 else 0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        _t8 = _tt() if _i20 else 0
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
+        if _i20:
+            _rec = dict(
+                bqwait=1, ts=_t4,
+                wait=(_t6 - _t4) // 1000,
+                aborts=(_t7 - _t6) // 1000,
+                ufo=(_t8 - _t7) // 1000,
+                nreq=len(scheduler_output.num_scheduled_tokens),
+                ntok=scheduler_output.total_num_scheduled_tokens)
+            _rec.update(getattr(self.scheduler, "_telem_i20_ufo", None) or {})
+            self._telem_i20_bq.append(_rec)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -1703,28 +1736,36 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
-        if _ie is not None:
+        if _ie is not None or (
+            _i20_recs := getattr(self, "_telem_i20_bq", None)
+        ):
             self._telem_i20_step = None
             from vllm.v1.worker import _iter16_telem as _i16
             import json as _json
             _tenq = time.monotonic_ns()
-            _prev = getattr(self, "_i20_prev_send", 0)
-            self._i20_prev_send = _ie["t2"]
-            _ufo = _ie.pop("ufo") or {}
-            _rec = {
-                "ec": 1, "ts": _ie["t0"],
-                "gap_prev_send": (_ie["t2"] - _prev) // 1000 if _prev else 0,
-                "sched": (_ie["t1"] - _ie["t0"]) // 1000,
-                "send": (_ie["t2"] - _ie["t1"]) // 1000,
-                "gram": (_ie["t3"] - _ie["t2"]) // 1000,
-                "wait": (_ie["t4"] - _ie["t3"]) // 1000,
-                "aborts": (_ie["t5"] - _ie["t4"]) // 1000,
-                "ufo": (_ie["t6"] - _ie["t5"]) // 1000,
-                "enqpost": (_tenq - _ie["t6"]) // 1000,
-                "nreq": _ie["nreq"], "ntok": _ie["ntok"],
-            }
-            _rec.update(_ufo)
-            _i16.line(_json.dumps(_rec))
+            if _ie is not None:
+                _prev = getattr(self, "_i20_prev_send", 0)
+                self._i20_prev_send = _ie["t2"]
+                _ufo = _ie.pop("ufo") or {}
+                _rec = {
+                    "ec": 1, "ts": _ie["t0"],
+                    "gap_prev_send": (_ie["t2"] - _prev) // 1000 if _prev else 0,
+                    "sched": (_ie["t1"] - _ie["t0"]) // 1000,
+                    "send": (_ie["t2"] - _ie["t1"]) // 1000,
+                    "gram": (_ie["t3"] - _ie["t2"]) // 1000,
+                    "wait": (_ie["t4"] - _ie["t3"]) // 1000,
+                    "aborts": (_ie["t5"] - _ie["t4"]) // 1000,
+                    "ufo": (_ie["t6"] - _ie["t5"]) // 1000,
+                    "enqpost": (_tenq - _ie["t6"]) // 1000,
+                    "nreq": _ie["nreq"], "ntok": _ie["ntok"],
+                }
+                _rec.update(_ufo)
+                _i16.line(_json.dumps(_rec))
+            if _i20_recs:
+                self._telem_i20_bq = []
+                for _rec in _i20_recs:
+                    _rec["enqpost"] = 0
+                    _i16.line(_json.dumps(_rec))
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
