@@ -44,6 +44,12 @@ def new_sect(**kv) -> "Sect | None":
     return Sect(**kv)
 
 
+# Shared-with-minor-modules hook: free functions that cannot receive the sect
+# (e.g. build_attn_metadata) mark sections on it when set. Per-process, set
+# and cleared by the model runner around one execute_model call.
+CURRENT: "Sect | None" = None
+
+
 def line(rec: str) -> None:
     if not ITER16_DIR:
         return

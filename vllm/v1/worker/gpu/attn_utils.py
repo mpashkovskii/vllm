@@ -492,6 +492,8 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    from vllm.v1.worker import _iter16_telem as _i16
+    _bam = _i16.CURRENT
     token_to_req_indices: torch.Tensor | None = None
     # Mamba groups with the same spec and builder differ only in their state
     # indices, so later groups re-gather those from the first group's metadata.
@@ -578,5 +580,8 @@ def build_attn_metadata(
                 cached_metadata[reuse_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+            if _bam is not None:
+                # iter-21: per-attn-group build time, group idx and spec class
+                _bam.m(f"bam{i}_{attn_group.kv_cache_spec.__class__.__name__[:8]}")
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata

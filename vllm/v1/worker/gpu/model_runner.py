@@ -1321,16 +1321,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        _g = getattr(self, "_i16_sect", None)
         # batch_idx -> req_id
         req_ids = sort_batch_req_ids(
             num_tokens_per_req, draft_tokens, self.decode_query_len
         )
+        if _g is not None: _g.m("gb_sort")
 
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
+        if _g is not None: _g.m("gb_ntok")
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.__getitem__, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.intp, count=num_reqs)
+        if _g is not None: _g.m("gb_idx")
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
         num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[
             idx_mapping_np
@@ -1615,6 +1619,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs_padded=input_batch.num_reqs_after_padding,
             num_computed_tokens=self.req_states.num_computed_tokens.gpu,
         )
+        _p = getattr(self, "_i16_sect", None)
+        if _p is not None: _p.m("bt")
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(
@@ -1791,6 +1797,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # one aggregated "prep" line per real batch. Inert without the env.
         _sect = _i16.new_sect(m="prep") if (_e and not dummy_run) else None
         self._i16_sect = _sect
+        _i16.CURRENT = _sect
         if not dummy_run:
             # Update the request states.
             _rec = {"m": "v2_states", "u0": time.monotonic_ns()} if _e else None
@@ -2047,6 +2054,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
+        if _sect is not None: _sect.m("mibl")
+
+        _ms_prepare_inputs = self.model_state.prepare_inputs(
+            input_batch, self.req_states
+        )
+        if _sect is not None: _sect.m("mspi")
 
         model_inputs = {
             "input_ids": input_ids,
@@ -2055,7 +2068,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **_ms_prepare_inputs,
         }
         if _sect is not None: _sect.m("mi")
         if not self.is_first_pp_rank:
@@ -2192,6 +2205,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _sect.rec["full"] = int(batch_desc.cg_mode == CUDAGraphMode.FULL)
             _sect.flush()
             self._i16_sect = None
+            _i16.CURRENT = None
         return None
 
     @torch.inference_mode()
