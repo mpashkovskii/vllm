@@ -1153,11 +1153,26 @@ class WorkerProc:
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers."""
+        from vllm.v1.worker import _iter16_telem as _i16
         assert self.rpc_broadcast_mq is not None
         while True:
             with get_watch_dog().disable():
+                _i16_dq = time.monotonic_ns() if _i16.enabled() else 0
                 rpc_request = self.rpc_broadcast_mq.dequeue(indefinite=True)
+            _i16_rec = None
+            if _i16.enabled() and isinstance(rpc_request[0], str) and \
+                    rpc_request[0] in ("execute_model", "sample_tokens"):
+                import json as _json
+                _i16_rec = (_json, self.rank, rpc_request[0], _i16_dq,
+                            time.monotonic_ns())
+            self._telem_i16 = _i16_rec
             self._execute_worker_rpc(rpc_request)
+            if _i16_rec is not None:
+                _i16.line(_i16_rec[0].dumps(
+                    {"m": _i16_rec[2], "dq": _i16_rec[3], "msg": _i16_rec[4],
+                     "call": getattr(self, "_telem_i16_call", 0),
+                     "ret": getattr(self, "_telem_i16_ret", 0),
+                     "out": time.monotonic_ns()}))
             del rpc_request
 
     def _execute_worker_rpc(
@@ -1174,7 +1189,11 @@ class WorkerProc:
 
             watchdog = get_watch_dog()
             watchdog.feed()
+            if getattr(self, "_telem_i16", None) is not None:
+                self._telem_i16_call = time.monotonic_ns()
             output = func(*args, **kwargs)
+            if getattr(self, "_telem_i16", None) is not None:
+                self._telem_i16_ret = time.monotonic_ns()
             # Feed again: the RPC itself may run close to the watchdog
             # timeout, so the pre-call feed can go stale while the result
             # is serialized/enqueued in handle_output().
