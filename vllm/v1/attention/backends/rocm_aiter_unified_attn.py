@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
@@ -88,25 +89,54 @@ class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
                 device=device,
             )
 
-    def _build_prefix_groups(self, attn_metadata: RocmAttentionMetadata):
+    def _build_prefix_groups(
+        self,
+        attn_metadata: RocmAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+        for_capture: bool = False,
+    ):
+        """Build the step's shared-prefix groups, or None when the call cannot use
+        them. A short-query batch (verify) groups all its requests; a mixed batch
+        the short requests it leads with (the batch order puts them first), which
+        unified_attention runs apart from the prompt chunks."""
         pg = self.prefix_groups
+        if pg is None or attn_metadata.causal is not True:
+            return None
+        seq_lens = attn_metadata.seq_lens
+        if attn_metadata.max_query_len <= _SHARED_PREFIX_MAX_QUERY_LEN:
+            num_seqs = seq_lens.shape[0]
+            lead = None
+        else:
+            if for_capture:
+                # a graph of a mixed batch would bake in this batch's split
+                return None
+            n = seq_lens.shape[0]
+            qsl = common_attn_metadata.query_start_loc_cpu[: n + 1].numpy()
+            qlens = qsl[1:] - qsl[:-1]
+            long_rows = np.flatnonzero(qlens > _SHARED_PREFIX_MAX_QUERY_LEN)
+            num_seqs = int(long_rows[0]) if len(long_rows) else n
+            if num_seqs == 0:
+                return None
+            lead = (num_seqs, int(qsl[num_seqs]), int(qlens[:num_seqs].max()))
         if (
-            pg is None
-            or attn_metadata.causal is not True
-            or attn_metadata.max_query_len > _SHARED_PREFIX_MAX_QUERY_LEN
-            or attn_metadata.seq_lens.shape[0] > pg.seq_shift.shape[0]
+            num_seqs > pg.seq_shift.shape[0]
             or attn_metadata.block_table.shape[1] > pg.bt_priv.shape[1]
+            or (lead is not None and lead[1] > pg.tok_vtok.shape[0])
         ):
             return None
         from aiter.ops.triton.attention.unified_attention import build_prefix_groups
 
         build_prefix_groups(
             pg,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            attn_metadata.query_start_loc,
+            attn_metadata.block_table[:num_seqs],
+            seq_lens[:num_seqs],
+            attn_metadata.query_start_loc[: num_seqs + 1],
             self.block_size,
         )
+        if lead is not None:
+            return pg._replace(
+                num_seqs=lead[0], num_tokens=lead[1], max_query_len=lead[2]
+            )
         return pg
 
     def build(
@@ -117,19 +147,23 @@ class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
     ) -> RocmAiterUnifiedAttentionMetadata:
         base = super().build(common_prefix_len, common_attn_metadata, fast_build)
         attn_metadata = RocmAiterUnifiedAttentionMetadata(**vars(base))
-        attn_metadata.prefix_groups = self._build_prefix_groups(attn_metadata)
+        attn_metadata.prefix_groups = self._build_prefix_groups(
+            attn_metadata, common_attn_metadata
+        )
         return attn_metadata
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> RocmAttentionMetadata:
-        attn_metadata = self.build(0, common_attn_metadata)
+        base = RocmAttentionMetadataBuilder.build(self, 0, common_attn_metadata)
+        attn_metadata = RocmAiterUnifiedAttentionMetadata(**vars(base))
         # Avoid capturing the real maximum sequence length while preserving
         # query_start_loc, which unified attention consumes during replay.
         attn_metadata.seq_lens.fill_(1)
-        if attn_metadata.prefix_groups is not None:
-            # groups of the capture's own lengths: none
-            self._build_prefix_groups(attn_metadata)
+        # groups of the capture's own lengths: none, in the buffers replays read
+        attn_metadata.prefix_groups = self._build_prefix_groups(
+            attn_metadata, common_attn_metadata, for_capture=True
+        )
         return attn_metadata
 
 
