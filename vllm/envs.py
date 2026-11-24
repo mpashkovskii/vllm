@@ -134,6 +134,8 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GDN_MTP_UPDATE_MIXED: bool = False
+    VLLM_GDN_DEFER_STATE_COMMIT: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
@@ -1300,6 +1302,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "cuda",
         ["cuda", "triton"],
         case_sensitive=False,
+    ),
+    # Run the speculative rows of a mixed (prefill + verify) batch through the
+    # Triton GDN MTP update kernel instead of fused_sigmoid_gating (ROCm).
+    "VLLM_GDN_MTP_UPDATE_MIXED": lambda: bool(
+        int(os.getenv("VLLM_GDN_MTP_UPDATE_MIXED", "0"))
+    ),
+    # Deferred GDN state commit for MTP verify steps (ROCm Triton path, implies
+    # VLLM_GDN_MTP_UPDATE_MIXED): store only the first verify token's state plus
+    # the draft tokens' rank-1 update records, and replay the accepted records
+    # at the next step instead of storing a full state per draft token.
+    "VLLM_GDN_DEFER_STATE_COMMIT": lambda: bool(
+        int(os.getenv("VLLM_GDN_DEFER_STATE_COMMIT", "0"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
