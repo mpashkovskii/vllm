@@ -674,9 +674,17 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        from vllm.v1.worker import _iter16_telem as _i16
+
+        _i20 = _i16.enabled()
+        _tt = time.monotonic_ns if _i20 else None
+        _t0 = _tt() if _i20 else 0
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        _t1 = _tt() if _i20 else 0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        _t2 = _tt() if _i20 else 0  # broadcast sent; workers start dequeueing
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        _t3 = _tt() if _i20 else 0
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -684,16 +692,24 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        _t4 = _tt() if _i20 else 0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        _t5 = _tt() if _i20 else 0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        _t6 = _tt() if _i20 else 0
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
-
+        if _i20:
+            self._telem_i20_step = dict(
+                t0=_t0, t1=_t1, t2=_t2, t3=_t3, t4=_t4, t5=_t5, t6=_t6,
+                nreq=len(scheduler_output.num_scheduled_tokens),
+                ntok=scheduler_output.total_num_scheduled_tokens,
+                ufo=getattr(self.scheduler, "_telem_i20_ufo", None))
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
@@ -1681,11 +1697,34 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        _ie = getattr(self, "_telem_i20_step", None)
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        if _ie is not None:
+            self._telem_i20_step = None
+            from vllm.v1.worker import _iter16_telem as _i16
+            import json as _json
+            _tenq = time.monotonic_ns()
+            _prev = getattr(self, "_i20_prev_send", 0)
+            self._i20_prev_send = _ie["t2"]
+            _ufo = _ie.pop("ufo") or {}
+            _rec = {
+                "ec": 1, "ts": _ie["t0"],
+                "gap_prev_send": (_ie["t2"] - _prev) // 1000 if _prev else 0,
+                "sched": (_ie["t1"] - _ie["t0"]) // 1000,
+                "send": (_ie["t2"] - _ie["t1"]) // 1000,
+                "gram": (_ie["t3"] - _ie["t2"]) // 1000,
+                "wait": (_ie["t4"] - _ie["t3"]) // 1000,
+                "aborts": (_ie["t5"] - _ie["t4"]) // 1000,
+                "ufo": (_ie["t6"] - _ie["t5"]) // 1000,
+                "enqpost": (_tenq - _ie["t6"]) // 1000,
+                "nreq": _ie["nreq"], "ntok": _ie["ntok"],
+            }
+            _rec.update(_ufo)
+            _i16.line(_json.dumps(_rec))
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
@@ -1758,7 +1797,16 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req) or self._reject_add_while_paused(req):
                 return
-            self.add_request(req, request_wave)
+            from vllm.v1.worker import _iter16_telem as _i16
+            if _i16.enabled():
+                _ta = time.monotonic_ns()
+                self.add_request(req, request_wave)
+                _i16.line(__import__("json").dumps(
+                    {"add": 1, "ts": _ta,
+                     "us": (time.monotonic_ns() - _ta) // 1000,
+                     "npt": getattr(req, "num_prompt_tokens", None)}))
+            else:
+                self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
