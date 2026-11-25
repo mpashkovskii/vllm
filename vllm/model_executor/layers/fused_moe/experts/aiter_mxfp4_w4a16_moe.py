@@ -369,12 +369,15 @@ def aiter_triton_kernel_w4a16_moe_forward(
         and gate_valid is None
         and activation == MoEActivation.SILU
         and not apply_router_weight_on_input
-        # Batch-shape gate: the a8w4-FP4W kernel wins at large chunked-prefill
-        # shapes (the mixed-step 8k/16k chunks) but loses to the tuned triton
-        # path at decode-sized shapes (isolated: 487.7 us/call at 131 tokens
-        # vs the 379.8 us in-server triton median; the win is the big-chunk
-        # mixed GEMM). Decode stays on the production path.
-        and hidden_states.shape[0] >= 2048
+        # NOTE: no batch-shape gate. The isolated decode comparison
+        # (487.7 us vs 379.8 us at 131 tokens) suggests gating decode to the
+        # tuned triton path, but that fallback is impossible here: the
+        # load-time repack drops the production W1 storage (max shape gate
+        # commit b8535e3f crashed at graph capture, IndexError in
+        # moe_gemm_a16w4 on the emptied w13_weight), and keeping it resident
+        # would cost exactly the memory the drop frees (the M3 KV budget).
+        # The flydsl kernel therefore dispatches at every shape; any decode
+        # penalty is what the in-server A/B/A measures.
     ):
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.stage1_a8w4fp4_server import (  # noqa: E501
             moe_stage1_a8w4fp4_forward,
