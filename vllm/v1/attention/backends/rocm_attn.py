@@ -131,6 +131,11 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             slot_mapping=slot_mapping,
             causal=common_attn_metadata.causal,
         )
+        from vllm import envs
+
+        if not (envs.VLLM_ROCM_CASCADE_DECODE or envs.VLLM_ROCM_CASCADE_MIXED):
+            return attn_metadata
+
         # Cascade (shared-prefix) decode: fill grouping metadata once per
         # step for the group's cascade-enabled impls; they skip their own
         # per-layer fills through the shared generation counter.

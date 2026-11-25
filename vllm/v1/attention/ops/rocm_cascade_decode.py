@@ -64,7 +64,10 @@ class CascadeState:
         max_reqs: int,
     ):
         fns = _cascade_aiter()
-        assert fns is not None
+        if fns is None:
+            raise RuntimeError(
+                "aiter.pa_decode_cascade ops not importable"
+            )
         (
             self.pa_decode_cascade,
             plan,
@@ -74,8 +77,9 @@ class CascadeState:
         self.device = device
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
-        # One item table row at most per pair of requests; singles cover all.
-        max_items = max(1, max_reqs // 2)
+        # Items cover groups and singletons (whole valid runs); singles
+        # remain for overflow-only fallback.
+        max_items = max(1, max_reqs)
         self.ws = plan(
             device,
             num_q_heads=num_q_heads,
@@ -321,12 +325,23 @@ def maybe_fill_step(
         # consumed by it.
         return
     if _cascade_aiter() is None:
+        # Cascade ops unavailable: run a stock path everywhere (no state
+        # allocation, no fill), no failure.
         return
     st = ws_builder_state
+    prof = os.environ.get("AITER_CASCADE_PROF")
+    if prof:
+        import time
+
+        t0 = time.perf_counter()
     gen = _FILL_GENERATION[0] + 1
     _FILL_GENERATION[0] = gen
     st.fill(st.ws, st.pl, block_table, seq_lens)
     st.mark_consumed_with(gen)
+    if prof:
+        torch.cuda.synchronize()
+        c = st.ws.counts.cpu().tolist()
+        print(f"[cascade-prof] builder fill gen={gen} time={(time.perf_counter()-t0)*1000:5.2f} items={c[0]} members={c[1]} singles={c[2]}")
     prof = os.environ.get("AITER_CASCADE_PROF")
     if prof:
         import time

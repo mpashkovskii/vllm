@@ -451,6 +451,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         attn_metadata.seq_lens_cpu_ub = common_attn_metadata.seq_lens_cpu_upper_bound
         attn_metadata.num_reqs = num_reqs
 
+        from vllm import envs
+
+        if not (envs.VLLM_ROCM_CASCADE_DECODE or envs.VLLM_ROCM_CASCADE_MIXED):
+            return attn_metadata
+
         # Cascade (shared-prefix) decode: one planner fill per step for the
         # group's cascade-enabled impls; they skip their own fills.
         from vllm.v1.attention.ops import rocm_cascade_decode as cascade
