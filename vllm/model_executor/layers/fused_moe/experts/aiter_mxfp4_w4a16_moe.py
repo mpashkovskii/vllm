@@ -369,6 +369,12 @@ def aiter_triton_kernel_w4a16_moe_forward(
         and gate_valid is None
         and activation == MoEActivation.SILU
         and not apply_router_weight_on_input
+        # Batch-shape gate: the a8w4-FP4W kernel wins at large chunked-prefill
+        # shapes (the mixed-step 8k/16k chunks) but loses to the tuned triton
+        # path at decode-sized shapes (isolated: 487.7 us/call at 131 tokens
+        # vs the 379.8 us in-server triton median; the win is the big-chunk
+        # mixed GEMM). Decode stays on the production path.
+        and hidden_states.shape[0] >= 2048
     ):
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.stage1_a8w4fp4_server import (  # noqa: E501
             moe_stage1_a8w4fp4_forward,
