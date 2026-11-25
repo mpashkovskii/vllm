@@ -19,6 +19,8 @@ steps). Both default to off while the path is validated. Nothing runs
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -93,8 +95,12 @@ class CascadeState:
         self.max_reqs = max_reqs
         self.table_width = table_width
 
+    def chunk_out(self, num_rows: int, shape, dtype, device) -> torch.Tensor:
+        return chunk_out(num_rows, shape, dtype, device)
+
     def run(self, output, query, k_cache, v_cache, seq_lens, block_table, scale, sinks):
-        n = seq_lens.shape[0]
+        if os.environ.get("VLLM_ROCM_CASCADE_RING"):
+            _ring_record(block_table, seq_lens)
         self.fill(self.ws, self.pl, block_table, seq_lens)
         self.pa_decode_cascade(
             output,
@@ -107,6 +113,23 @@ class CascadeState:
             sinks=sinks,
             workspace=self.ws,
         )
+
+
+# One chunk staging buffer per (tail shape, dtype), shared by every
+# attention instance -- layers run sequentially, so one buffer each.
+_CHUNK_BUFS: dict[tuple, torch.Tensor] = {}
+
+
+def chunk_out(num_rows: int, shape, dtype, device) -> torch.Tensor:
+    key = (device, dtype, shape[1:])
+    rows_needed = (num_rows + 1023) // 1024 * 1024
+    buf = _CHUNK_BUFS.get(key)
+    if buf is None or buf.shape[0] < num_rows:
+        _CHUNK_BUFS[key] = torch.empty(
+            (rows_needed, *shape[1:]), dtype=dtype, device=device
+        )
+        buf = _CHUNK_BUFS[key]
+    return buf[:num_rows]
 
 
 _STATES: dict[tuple, CascadeState] = {}
@@ -183,7 +206,11 @@ def _state_for(state_key, device, heads, kv_heads, dim, width, max_reqs) -> Casc
     return st
 
 
-def decode_rows_maps(query_start_loc: torch.Tensor, seq_lens: torch.Tensor):
+def decode_rows_maps(
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_actual_tokens: int | None = None,
+):
     """Decode-row routing for a mixed step (torch ops, eager-only).
 
     Returns (dec_req, dec_q_map, chk_req, chk_tok, chk_cu_q, chk_len_k):
@@ -207,7 +234,9 @@ def decode_rows_maps(query_start_loc: torch.Tensor, seq_lens: torch.Tensor):
             torch.cumsum(chk_qlens, 0),
         ]
     ).to(qsl.dtype)
-    total_tokens = qsl[-1] - qsl[0]
+    total_tokens = int(qsl[-1] - qsl[0])
+    if num_actual_tokens is not None:
+        total_tokens = min(total_tokens, int(num_actual_tokens))
     tok_of_req = (
         torch.searchsorted(qsl, torch.arange(total_tokens, device=qsl.device), right=True)
         - 1
@@ -215,3 +244,27 @@ def decode_rows_maps(query_start_loc: torch.Tensor, seq_lens: torch.Tensor):
     chk_tok = torch.nonzero(~is_dec[tok_of_req], as_tuple=False).squeeze(1).to(torch.int32)
     chk_len_k = seq_lens[chk_req.long()]
     return dec_req, dec_q_map, chk_req, chk_tok, chk_cu, chk_len_k
+
+
+# Rolling record of planner inputs for fault forensics (enabled with
+# VLLM_ROCM_CASCADE_RING). Keeps the last N lens tables on host.
+_RING_KEEP = 24
+_ring_buf = []
+_ring_i = 0
+
+
+def _ring_record(bt, lens, q_map=None):
+    keep = bt.to("cpu", non_blocking=True), lens.to("cpu", non_blocking=True), (
+        None if q_map is None else q_map.to("cpu", non_blocking=True)
+    )
+    global _ring_i
+    _ring_buf.append((keep[1], keep[0], keep[2], torch.cuda.Event()))
+    if len(_ring_buf) > _RING_KEEP:
+        _ring_buf.pop(0)
+    import os
+    path = os.environ.get("VLLM_ROCM_CASCADE_RING_PATH", "/tmp/cascade_ring")
+    os.makedirs(path, exist_ok=True)
+    # fire-and-forget append
+    torch.save((keep[1].to("cpu"), keep[0].to("cpu"), None if keep[2] is None else keep[2].to("cpu")),
+               f"{path}/ring_{_ring_i:06d}.pt")
+    _ring_i += 1

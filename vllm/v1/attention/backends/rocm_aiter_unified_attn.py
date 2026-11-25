@@ -433,7 +433,9 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             )
             return True
         dec_req, dec_q_map, chk_req, chk_tok, chk_cu, chk_len_k = (
-            cascade.decode_rows_maps(m.query_start_loc, m.seq_lens)
+            cascade.decode_rows_maps(
+                m.query_start_loc, m.seq_lens, m.num_actual_tokens
+            )
         )
         if dec_req.numel() == 0:
             return False
@@ -455,7 +457,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             return True
         # Chunk rows keep the unified kernel, on their token subset.
         chk_q = query.index_select(0, chk_tok.long())
-        chk_out = torch.empty_like(chk_q)
+        chk_out = st.chunk_out(chk_q.shape[0], chk_q.shape, chk_q.dtype, chk_q.device)
         self.unified_attention(
             q=chk_q,
             k=key_cache,

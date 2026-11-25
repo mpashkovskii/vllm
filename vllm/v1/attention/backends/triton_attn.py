@@ -1421,12 +1421,15 @@ class TritonAttentionImpl(AttentionImpl):
             )
             return True
         dec_req, dec_q_map, chk_req, chk_tok, chk_cu, chk_len_k = (
-            cascade.decode_rows_maps(m.query_start_loc, m.seq_lens)
+            cascade.decode_rows_maps(
+                m.query_start_loc, m.seq_lens, m.num_actual_tokens
+            )
         )
         if dec_req.numel() == 0:
             return False
         dec_tables = m.block_table.index_select(0, dec_req.long())
         dec_lens = m.seq_lens.index_select(0, dec_req.long())
+        cascade._ring_record(dec_tables, dec_lens, dec_q_map)
         st.fill(st.ws, st.pl, dec_tables, dec_lens, q_map_of_req=dec_q_map)
         st.pa_decode_cascade(
             output[:num_tokens],
@@ -1443,9 +1446,7 @@ class TritonAttentionImpl(AttentionImpl):
             return True
         # Chunk rows keep the unified kernel, on their token subset.
         chk_q = query.index_select(0, chk_tok.long())
-        chk_out = torch.empty_like(chk_q)
-        chk_k = k_cache
-        chk_v = v_cache
+        chk_out = st.chunk_out(chk_q.shape[0], chk_q.shape, chk_q.dtype, chk_q.device)
         unified_attention(
             q=chk_q,
             k=key_cache,
