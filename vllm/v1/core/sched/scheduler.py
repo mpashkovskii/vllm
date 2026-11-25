@@ -2274,6 +2274,15 @@ class Scheduler(SchedulerInterface):
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        from vllm.v1.worker import _iter16_telem as _i16
+        _i20 = _i16.enabled()
+        _tt = time.monotonic_ns
+        _i20_t_def = _tt() if _i20 else 0
+        _i20_free_ns = 0
+        _i20_acc_ns = 0
+        _i20_stop_ns = 0
+        _i20_nfin = 0
+
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
@@ -2281,6 +2290,7 @@ class Scheduler(SchedulerInterface):
             self._drain_deferred_frees()
             self._drain_deferred_loads()
 
+        _i20_t_loop = _tt() if _i20 else 0
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
@@ -2401,9 +2411,12 @@ class Scheduler(SchedulerInterface):
             # Check for stop and update request status.
             if new_token_ids:
                 has_output_placeholders = request.num_output_placeholders > 0
+                _tsu = _tt() if _i20 else 0
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )
+                if _i20:
+                    _i20_stop_ns += _tt() - _tsu
                 if (
                     not output_is_stale
                     and status_before_stop == RequestStatus.RUNNING
@@ -2429,9 +2442,15 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            if new_token_ids and not self.structured_output_manager.accept_tokens(
-                request, new_token_ids
-            ):
+            _grammar_rejected = False
+            if new_token_ids:
+                _tacc = _tt() if _i20 else 0
+                _grammar_rejected = not self.structured_output_manager.accept_tokens(
+                    request, new_token_ids
+                )
+                if _i20:
+                    _i20_acc_ns += _tt() - _tacc
+            if _grammar_rejected:
                 logger.error(
                     "Unexpected: grammar rejected tokens %s for request %s. "
                     "Terminating request.",
@@ -2473,7 +2492,11 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    _tf = _tt() if _i20 else 0
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    if _i20:
+                        _i20_free_ns += _tt() - _tf
+                        _i20_nfin += 1
                     if (
                         prefill_stats is not None
                         and kv_transfer_params is not None
@@ -2538,6 +2561,7 @@ class Scheduler(SchedulerInterface):
                 assert not prompt_logprobs_tensors
                 assert prompt_token_id_logprobs is None
 
+        _i20_t_loopend = _tt() if _i20 else 0
         # Remove stopped requests from their queues, then enqueue the ones
         # that continue, so each ends up in exactly one queue.
         if stopped_running_reqs:
@@ -2673,6 +2697,16 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        if _i20:
+            self._telem_i20_ufo = {
+                "ufo_def": (_i20_t_loop - _i20_t_def) // 1000,
+                "ufo_loop": (_i20_t_loopend - _i20_t_loop) // 1000,
+                "ufo_tail": (_tt() - _i20_t_loopend) // 1000,
+                "ufo_free": _i20_free_ns // 1000,
+                "ufo_acc": _i20_acc_ns // 1000,
+                "ufo_stop": _i20_stop_ns // 1000,
+                "nfin": _i20_nfin,
+            }
         return engine_core_outputs
 
     def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:

@@ -3,6 +3,7 @@
 import copyreg
 import functools
 import io
+import json
 import os
 import pickle
 import shutil
@@ -78,6 +79,57 @@ SHM_NOTIFY_POLL_INTERVAL_S = 2.0
 from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
 
 
+# ---------------------------------------------------------------------------
+# iter-23 ring-slot state tracing (env-gated, inert when unset).
+#
+# Root-cause tooling for the fleet-pause mechanism 2 (engine parks 1-13 s in
+# acquire_read on a response mq while the awaited response was already
+# enqueued ~0.1 s after park start). Records, per local message queue,
+# the writer's ring-slot writes and notify sends, and the reader's parks,
+# poll outcomes and successful reads, with the full metadata flag snapshot
+# at each point. Joining writer "w"/"n" events against reader
+# "park"/"poll"/"read" events on the same notify address and slot names
+# whether the reader and writer disagree about the ring slot (slot
+# aliasing) or the zmq notify fails to wake a parked reader whose flag is
+# already set (notify-path failure).
+#
+# Set VLLM_ITER23_RING to a directory to enable. One append-only JSONL file
+# per process (ring_<pid>.jsonl). Timestamps are time.monotonic_ns()
+# (CLOCK_MONOTONIC on Linux: one clock base across processes).
+# Keep this OFF on all benchmark protocol arms (as for VLLM_ITER16_TELEM).
+# ---------------------------------------------------------------------------
+_ITER23_RING_DIR = os.environ.get("VLLM_ITER23_RING")
+_iter23_ring_fd = None
+
+
+def _ring_enabled() -> bool:
+    return bool(_ITER23_RING_DIR)
+
+
+def _ring_line(rec: str) -> None:
+    global _iter23_ring_fd
+    if not _ITER23_RING_DIR:
+        return
+    if _iter23_ring_fd is None:
+        _iter23_ring_fd = os.open(
+            os.path.join(_ITER23_RING_DIR, f"ring_{os.getpid()}.jsonl"),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o644,
+        )
+    try:
+        os.write(_iter23_ring_fd, rec.encode() + b"\n")
+    except OSError:
+        pass
+
+
+def _ring_flags_hex(metadata_buffer) -> str:
+    """Snapshot of the slot metadata row (written flag + reader flags)."""
+    try:
+        return bytes(metadata_buffer).hex()
+    except Exception:
+        return "?"
+
+
 # Memory fence for cross-process shared memory visibility.
 # Required for correct producer-consumer synchronization when using
 # shared memory without locks.
@@ -141,6 +193,9 @@ class SpinCondition:
         busy_loop_s: float = 1,
     ):
         self.is_reader = is_reader
+        # iter-23: keep the address for trace correlation between the
+        # writer's notify and the reader's poll events.
+        self.notify_address = notify_address
 
         if is_reader:
             # Time of last shm buffer read
@@ -173,12 +228,29 @@ class SpinCondition:
             self.poller.register(self.read_cancel_socket, zmq.POLLIN)
             self.poller.register(self.local_notify_socket, zmq.POLLIN)
         else:
-            # Writer side publishes write notifications
-            self.local_notify_socket: zmq.Socket = context.socket(PUB)  # type: ignore
-            # Set high water mark to 1 - we don't need to send a massive amount of
-            # pings during busy operation. PUB sockets will silently drop subsequent
-            # messages after the high water mark is reached.
-            self.local_notify_socket.setsockopt(zmq.SNDHWM, 1)
+            # Writer side publishes write notifications. XPUB with an
+            # unlimited high water mark (SNDHWM=0) so no ping is ever dropped
+            # for capacity: PUB drops a ping sent within zmq's stale
+            # pipe-view window (~1-3 ms on x86) of enough previous ones whose
+            # sum reaches the HWM (1, or any finite value), even when the
+            # reader already consumed them. A reader that parked in between
+            # the writes then sleeps until SHM_READER_RECHECK_INTERVAL_MS
+            # (5 s) per poll cycle, which shows up as rare multi-second
+            # fleet-wide pauses (engine core parked in get_response while
+            # all workers idle in the command dequeue; worker cores parked
+            # symmetrically when the engine is the writer).
+            # The readers' SUB with CONFLATE already collapses a ping burst
+            # into one, so the unlimited writer queue does not change what a
+            # reader sees; XPUB (rather than PUB + SNDHWM=0) matches upstream
+            # vllm-project/vllm#68441 and also surfaces subscription
+            # messages to anyone who wants them (nobody here reads them).
+            # (diagnosis: upstream vllm-project/vllm#58917 by tobymao,
+            # co-authored into #68441; rediscovered on DeepSeek-V4.1-Flash
+            # TP4 with 0.27-5.41 s engine future.result() parks; SNDHWM=1
+            # removal alone left 1-2 recheck-quantized parks per c128 hour
+            # on mixed 16k-token steps.)
+            self.local_notify_socket: zmq.Socket = context.socket(XPUB)  # type: ignore
+            self.local_notify_socket.setsockopt(zmq.SNDHWM, 0)
             self.local_notify_socket.bind(notify_address)
 
             self.last_read = 0
@@ -218,21 +290,41 @@ class SpinCondition:
         if current_time <= self.last_read + self.busy_loop_s:
             sched_yield()
         else:
+            _rt_ts0 = time.monotonic_ns() if _ring_enabled() else 0
             events = dict(self.poller.poll(timeout=timeout_ms))
 
             if self.read_cancel_socket in events:
                 logger.debug("Poller received cancel event")
+                _rt_why = "cancel"
             elif self.local_notify_socket in events:
                 logger.debug("Poller received notify event")
                 # Since zmq.CONFLATE is set, there will only be one notification
                 # to read from the socket
                 self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
+                _rt_why = "notify"
             else:
                 logger.debug("Poller timed out")
+                _rt_why = "timeout"
+            if _ring_enabled():
+                _ring_line(
+                    json.dumps({
+                        "ev": "poll",
+                        "ts": _rt_ts0,
+                        "us": (time.monotonic_ns() - _rt_ts0) // 1000,
+                        "why": _rt_why,
+                        "addr": self.notify_address,
+                    }))
 
     def notify(self):
         """Notifies all readers to wake up"""
         assert not self.is_reader, "Only writers can notify"
+        if _ring_enabled():
+            _ring_line(
+                json.dumps({
+                    "ev": "n",
+                    "ts": time.monotonic_ns(),
+                    "addr": self.notify_address,
+                }))
         self.local_notify_socket.send(b"\x00")
 
 
@@ -767,6 +859,7 @@ class MessageQueue:
                 # found a block that is either
                 # (1) not written
                 # (2) read by all readers
+                _rt_write_waited = time.monotonic() - start_time if _ring_enabled() else 0.0
 
                 # mark the block as not written
                 metadata_buffer[0] = 0
@@ -794,6 +887,16 @@ class MessageQueue:
                 # before we proceed. Without this, readers may spin indefinitely
                 # waiting for a write that's stuck in our CPU's store buffer.
                 memory_fence()
+                if _ring_enabled():
+                    _ring_line(
+                        json.dumps({
+                            "ev": "w",
+                            "ts": time.monotonic_ns(),
+                            "addr": self.handle.local_notify_addr,
+                            "slot": self.current_idx,
+                            "flags": _ring_flags_hex(metadata_buffer),
+                            "wait_us": int(_rt_write_waited * 1e6),
+                        }))
                 self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
                 break
 
@@ -868,6 +971,20 @@ class MessageQueue:
         # for readers, `self.current_idx` is the next block to read
         # if this block is not ready,
         # we need to wait until it is written
+        if _ring_enabled():
+            # Log only idle-phase waits (the poll iterations, one per recheck
+            # interval): the busy-spin phase would log per sched_yield.
+            _sc = self._spin_condition
+            if time.monotonic() > _sc.last_read + _sc.busy_loop_s:
+                _ring_line(
+                    json.dumps({
+                        "ev": "wait",
+                        "ts": time.monotonic_ns(),
+                        "addr": self.handle.local_notify_addr,
+                        "slot": self.current_idx,
+                        "flags": _ring_flags_hex(metadata_buffer),
+                        "rr": self.local_reader_rank,
+                    }))
         self._spin_condition.wait(timeout_ms=read_timeout.timeout_ms())
 
         if self.shutting_down:
@@ -889,8 +1006,20 @@ class MessageQueue:
             timeout=timeout, should_warn=not indefinite
         )
         with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+            _rt_park_ts = 0
             while True:
                 if not self._wait_until_readable(metadata_buffer, read_timeout):
+                    if _ring_enabled() and not _rt_park_ts:
+                        _rt_park_ts = time.monotonic_ns()
+                        _ring_line(
+                            json.dumps({
+                                "ev": "park",
+                                "ts": _rt_park_ts,
+                                "addr": self.handle.local_notify_addr,
+                                "slot": self.current_idx,
+                                "flags": _ring_flags_hex(metadata_buffer),
+                                "rr": self.local_reader_rank,
+                            }))
                     continue
                 # found a block that is not read by this reader
                 # let caller read from the buffer
@@ -904,6 +1033,17 @@ class MessageQueue:
                         # Without this, writer may not see our read completion and
                         # could wait indefinitely for all readers to finish.
                         memory_fence()
+                        if _ring_enabled():
+                            _ring_line(
+                                json.dumps({
+                                    "ev": "read",
+                                    "ts": time.monotonic_ns(),
+                                    "addr": self.handle.local_notify_addr,
+                                    "slot": self.current_idx,
+                                    "flags": _ring_flags_hex(metadata_buffer),
+                                    "rr": self.local_reader_rank,
+                                    "park": _rt_park_ts,
+                                }))
                         next_idx = self.current_idx + 1
                         self.current_idx = next_idx % self.buffer.max_chunks
                         self._spin_condition.record_read()
@@ -955,6 +1095,14 @@ class MessageQueue:
             if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:
                 with self.acquire_write(timeout) as buf:
                     buf[0] = 1  # overflow
+                if _ring_enabled():
+                    _ring_line(
+                        json.dumps({
+                            "ev": "wo",
+                            "ts": time.monotonic_ns(),
+                            "addr": self.handle.local_notify_addr,
+                            "bytes": total_bytes + len(all_buffers[0]),
+                        }))
                 self.local_socket.send_multipart(all_buffers, copy=False)
             else:
                 # Byte 0: 0
@@ -1002,7 +1150,16 @@ class MessageQueue:
                         all_buffers.append(buffer if i == 0 else bytearray(buffer))
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
             if overflow:
+                _rt_ts0 = time.monotonic_ns() if _ring_enabled() else 0
                 obj = MessageQueue.recv(self.local_socket, timeout)
+                if _ring_enabled():
+                    _ring_line(
+                        json.dumps({
+                            "ev": "ro",
+                            "ts": _rt_ts0,
+                            "us": (time.monotonic_ns() - _rt_ts0) // 1000,
+                            "addr": self.handle.local_notify_addr,
+                        }))
         elif self._is_remote_reader:
             obj = MessageQueue.recv(self.remote_socket, timeout)
         else:
