@@ -543,12 +543,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         pin = self._cascade_pin
         step = self._cascade_step
         self._cascade_step = None
-        if step is None:
+        if step is None or torch.cuda.is_current_stream_capturing():
             # No hook this step (CUDA-graph capture builds, draft-decode
-            # refresh): the persistent buffers hold the previous step's
-            # values or the zeroed defaults from __init__; emitting device
-            # ops here would capture them into decode CUDA graphs, where
-            # they would zero this step's committed descriptors on replay.
+            # refresh) or a capture-build running on current main: the
+            # persistent buffers hold the previous step's values or the
+            # zeroed defaults from __init__; emitting device ops here
+            # would capture them into decode CUDA graphs, where they
+            # would zero this step's committed descriptors on replay.
             return
         n, it_row, it_mem, it_sblk, grp_flag, bt_sh, sq_sh, max_sqb = step
         pin["it_row"].zero_()
@@ -1047,6 +1048,7 @@ class TritonAttentionImpl(AttentionImpl):
         # falls through to the stock full-batch path.
         if (
             self._hd512_mfma_chunk
+            and not torch.cuda.is_current_stream_capturing()
             and attn_metadata.max_query_len > 1
             and kv_cache.shape[2] == 16
             and kv_cache.dtype == torch.bfloat16
