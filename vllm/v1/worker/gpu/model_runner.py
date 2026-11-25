@@ -1751,7 +1751,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         creates each group's CPU block-table shadow."""
         ctx = []
         for gid in range(len(self.kv_cache_config.kv_cache_groups)):
-            spec = self.kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            group = self.kv_cache_config.kv_cache_groups[gid]
+            specs = getattr(group, "kv_cache_specs", None)
+            if specs:
+                spec = next(iter(specs.values()))
+            else:
+                spec = group.kv_cache_spec
             if getattr(spec, "head_size", None) != 512:
                 continue
             if getattr(spec, "num_kv_heads", None) != 2:

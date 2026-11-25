@@ -450,6 +450,23 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         attn_metadata.seq_lens_cpu_ub = common_attn_metadata.seq_lens_cpu_upper_bound
         attn_metadata.num_reqs = num_reqs
+
+        # Cascade (shared-prefix) decode: one planner fill per step for the
+        # group's cascade-enabled impls; they skip their own fills.
+        from vllm.v1.attention.ops import rocm_cascade_decode as cascade
+
+        st = cascade._state_for(
+            (),
+            block_table_tensor.device,
+            self.num_heads_q,
+            self.num_heads_kv,
+            self.headdim,
+            block_table_tensor.shape[1],
+            max(block_table_tensor.shape[0], seq_lens.shape[0]),
+        )
+        cascade.maybe_fill_step(
+            st, block_table_tensor, seq_lens, max_query_len
+        )
         return attn_metadata
 
     def update_draft_decode_metadata(self, _metadata: TritonAttentionMetadata) -> None:

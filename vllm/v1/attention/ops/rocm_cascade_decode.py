@@ -94,14 +94,39 @@ class CascadeState:
         )
         self.max_reqs = max_reqs
         self.table_width = table_width
+        self.filled_epoch = 0
+        self.consumed_epoch = 0
 
     def chunk_out(self, num_rows: int, shape, dtype, device) -> torch.Tensor:
         return chunk_out(num_rows, shape, dtype, device)
 
+    def ensure_filled(self, block_table, seq_lens, q_map_of_req=None, *, ring=False):
+        """Fill cascade metadata if the builder did not already fill this step."""
+        if self.filled_epoch > self.consumed_epoch:
+            return False
+        if ring:
+            _ring_record(block_table, seq_lens, q_map_of_req)
+        self.fill(self.ws, self.pl, block_table, seq_lens, q_map_of_req=q_map_of_req)
+        self.filled_epoch += 1
+        self.consumed_epoch = self.filled_epoch
+        return True
+
+    def mark_consumed_with(self, generation: int) -> None:
+        if generation > self.filled_epoch:
+            self.filled_epoch = generation
+        self.consumed_epoch = max(self.consumed_epoch, generation)
+
     def run(self, output, query, k_cache, v_cache, seq_lens, block_table, scale, sinks):
-        if os.environ.get("VLLM_ROCM_CASCADE_RING"):
-            _ring_record(block_table, seq_lens)
-        self.fill(self.ws, self.pl, block_table, seq_lens)
+        ring = os.environ.get("VLLM_ROCM_CASCADE_RING") is not None
+        prof = os.environ.get("AITER_CASCADE_PROF")
+        if prof:
+            import time
+
+            t0 = time.perf_counter()
+        self.ensure_filled(block_table, seq_lens, ring=ring)
+        if prof:
+            torch.cuda.synchronize()
+            print(f"[cascade-prof] fill={(time.perf_counter()-t0)*1000:6.2f}")
         self.pa_decode_cascade(
             output,
             query,
@@ -195,7 +220,10 @@ def describe_blocked_call() -> str:
 
 
 def _state_for(state_key, device, heads, kv_heads, dim, width, max_reqs) -> CascadeState:
-    key = (state_key, heads, kv_heads, dim, width, max_reqs)
+    # Geometry-only key: every attention instance of one KV-cache group
+    # shares one cascade state. Planner metadata is layer-independent;
+    # each layer folds its own query through it in stream order.
+    key = (heads, kv_heads, dim, width, max_reqs)
     st = _STATES.get(key)
     if st is None:
         st = CascadeState(device, heads, kv_heads, dim, width, max_reqs)
@@ -268,3 +296,39 @@ def _ring_record(bt, lens, q_map=None):
     torch.save((keep[1].to("cpu"), keep[0].to("cpu"), None if keep[2] is None else keep[2].to("cpu")),
                f"{path}/ring_{_ring_i:06d}.pt")
     _ring_i += 1
+
+
+_FILL_GENERATION = [0]
+
+
+def maybe_fill_step(
+    ws_builder_state,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_query_len: int,
+):
+    """Builder-side per-step planner fill for the shared cascade state.
+
+    Called from an attention metadata builder's build(): advances the
+    shared state's fill generation so the group's attention instances
+    skip their own fill. Off entirely with the cascade flags off.
+    """
+    if not (envs.VLLM_ROCM_CASCADE_DECODE or envs.VLLM_ROCM_CASCADE_MIXED):
+        return
+    if max_query_len != 1:
+        # Not a pure-decode step: the mixed path fills its own decode
+        # subset per call; the pure fill over the full batch would not be
+        # consumed by it.
+        return
+    if _cascade_aiter() is None:
+        return
+    st = ws_builder_state
+    gen = _FILL_GENERATION[0] + 1
+    _FILL_GENERATION[0] = gen
+    st.fill(st.ws, st.pl, block_table, seq_lens)
+    st.mark_consumed_with(gen)
+    prof = os.environ.get("AITER_CASCADE_PROF")
+    if prof:
+        import time
+
+        print(f"[cascade-prof] builder fill gen={gen}")

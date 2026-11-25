@@ -131,6 +131,23 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             slot_mapping=slot_mapping,
             causal=common_attn_metadata.causal,
         )
+        # Cascade (shared-prefix) decode: fill grouping metadata once per
+        # step for the group's cascade-enabled impls; they skip their own
+        # per-layer fills through the shared generation counter.
+        from vllm.v1.attention.ops import rocm_cascade_decode as cascade
+
+        st = cascade._state_for(
+            (),
+            block_table_tensor.device,
+            self.num_heads_q,
+            self.num_heads_kv,
+            self.headdim,
+            block_table_tensor.shape[1],
+            max(block_table_tensor.shape[0], seq_lens.shape[0]),
+        )
+        cascade.maybe_fill_step(
+            st, block_table_tensor, seq_lens, max_query_len
+        )
         return attn_metadata
 
 
